@@ -1,0 +1,3 @@
+# chainweave
+
+Minimal project initialization.
