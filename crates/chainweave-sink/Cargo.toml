@@ -1,0 +1,16 @@
+[package]
+name = "chainweave-sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+metrics-exporter-prometheus.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

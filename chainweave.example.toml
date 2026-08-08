@@ -1,0 +1,23 @@
+[rpc]
+primary_url = "http://127.0.0.1:8545"
+# verifier_url = "wss://example.invalid/ws"
+
+[indexer]
+header_cache_size = 256
+max_reorg_depth = 2048
+# safe_depth = 12
+# finalized_depth = 64
+
+[queues]
+fetch = 128
+coordinate = 64
+decode = 128
+write = 64
+
+[server]
+listen_addr = "127.0.0.1:9100"
+
+# Set secrets through CHAINWEAVE_DATABASE_URL and CHAINWEAVE_KAFKA_BROKERS.
+# [expected_chain]
+# chain_id = 31337
+# genesis_hash = "0x..."

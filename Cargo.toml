@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/chainweave-cli",
+    "crates/chainweave-core",
+    "crates/chainweave-rpc",
+    "crates/chainweave-sink",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.94.1"
+
+[workspace.dependencies]
+alloy = { version = "2.3.0", default-features = false, features = ["provider-http", "provider-ws", "reqwest-rustls-tls", "rpc-types"] }
+anyhow = "1.0.100"
+axum = "0.8.8"
+clap = { version = "4.5.54", features = ["derive", "env"] }
+figment = { version = "0.10.19", features = ["env", "toml"] }
+metrics = "0.24.3"
+metrics-exporter-prometheus = { version = "0.18.1", default-features = false, features = ["http-listener"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+url = { version = "2.5.8", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
