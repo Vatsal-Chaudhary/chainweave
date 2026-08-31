@@ -7,10 +7,16 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
+chainweave-core = { path = "../chainweave-core" }
 metrics-exporter-prometheus.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

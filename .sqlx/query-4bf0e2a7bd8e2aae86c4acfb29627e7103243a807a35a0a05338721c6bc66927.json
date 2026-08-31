@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO outbox_events (\n                chain_id, event_kind, block_hash, block_height, payload\n            )\n            VALUES (($1::text)::numeric, $2, $3, $4, $5)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bytea",
+        "Int8",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4bf0e2a7bd8e2aae86c4acfb29627e7103243a807a35a0a05338721c6bc66927"
+}

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                logs.transaction_index,\n                logs.log_index,\n                logs.tx_hash,\n                logs.address,\n                logs.topics,\n                logs.data,\n                logs.decoded_event,\n                logs.decoder_version\n            FROM logs\n            JOIN blocks\n              ON blocks.chain_id = logs.chain_id\n             AND blocks.block_hash = logs.block_hash\n            WHERE logs.chain_id = ($1::text)::numeric\n              AND blocks.is_canonical\n            ORDER BY logs.block_number, logs.transaction_index, logs.log_index\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "log_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "tx_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "address",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "topics",
+        "type_info": "ByteaArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "data",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "decoded_event",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "decoder_version",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "a38d83e6eb3d592a5e0b7a4737749e56f8585302dbaef09ed06dd4ccdc68297f"
+}

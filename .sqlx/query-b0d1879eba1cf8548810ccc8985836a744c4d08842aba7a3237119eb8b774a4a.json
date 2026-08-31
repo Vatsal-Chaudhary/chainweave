@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE blocks\n            SET is_canonical = FALSE\n            WHERE chain_id = ($1::text)::numeric\n              AND block_hash = $2\n              AND height = $3\n              AND is_canonical\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b0d1879eba1cf8548810ccc8985836a744c4d08842aba7a3237119eb8b774a4a"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO checkpoint (chain_id, last_height, last_hash)\n            VALUES (($1::text)::numeric, $2, $3)\n            ON CONFLICT (chain_id) DO UPDATE\n            SET last_height = EXCLUDED.last_height,\n                last_hash = EXCLUDED.last_hash,\n                updated_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1c4eab73784acceab78a3fe033f549ffc80900bda7afe2bf5454db15dab07e2e"
+}

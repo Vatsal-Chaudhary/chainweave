@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO chain_identity (chain_id, genesis_hash)\n            VALUES (($1::text)::numeric, $2)\n            ON CONFLICT (chain_id) DO UPDATE\n            SET genesis_hash = EXCLUDED.genesis_hash\n            WHERE chain_identity.genesis_hash = EXCLUDED.genesis_hash\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "016745e3b1e1850320955d7114da4b87016569ca4346f959ea99314062071e8c"
+}

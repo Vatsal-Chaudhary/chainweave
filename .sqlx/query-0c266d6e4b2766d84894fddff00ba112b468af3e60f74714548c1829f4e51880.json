@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT last_height, last_hash\n            FROM checkpoint\n            WHERE chain_id = ($1::text)::numeric\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_height",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_hash",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0c266d6e4b2766d84894fddff00ba112b468af3e60f74714548c1829f4e51880"
+}

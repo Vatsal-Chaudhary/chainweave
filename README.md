@@ -1,8 +1,8 @@
 # chainweave
 
-A reorg-safe EVM chain indexer in Rust. The project is being delivered milestone by milestone from the [FDD](docs/reorg-safe-indexer-FDD.md); M0 establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, and observability primitives.
+A reorg-safe EVM chain indexer in Rust. The project is being delivered incrementally from the [FDD](docs/reorg-safe-indexer-FDD.md); the current baseline establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, and observability primitives.
 
-## M0 quickstart
+## Quickstart
 
 Install the Rust toolchain, then run a local EVM node. Anvil is distributed with Foundry:
 
@@ -45,11 +45,11 @@ CHAINWEAVE_TESTNET_RPC_URL=https://YOUR_TESTNET_RPC \
   cargo test -p chainweave-cli --test testnet_smoke -- --ignored --nocapture
 ```
 
-The `chainweave-sink` crate provides fail-closed `/health` and `/ready` state plus a Prometheus `/metrics` handler. A long-running worker process will bind these in a later milestone; M0 only establishes and tests the server primitive.
+The `chainweave-sink` crate provides fail-closed `/health` and `/ready` state plus a Prometheus `/metrics` handler. A long-running worker process will bind these in a later increment; the current baseline only establishes and tests the server primitive.
 
-## M1 reorg flow
+## Reorg flow
 
-The current M1 transition module is pure in-memory chain coordination. It proves ancestry, emits ordered canonicality transitions, and leaves durable writes/outbox delivery for later milestones.
+The current transition module is pure in-memory chain coordination. It proves ancestry, emits ordered canonicality transitions, and leaves durable writes/outbox delivery for later increments.
 
 ```mermaid
 flowchart TD
@@ -67,6 +67,6 @@ flowchart TD
     I --> K[Rollback orphaned blocks<br/>descendant first]
     K --> L[Apply replacement branch<br/>ancestor first]
     L --> M[Return ChainEvent batch]
-    M -. M2 future .-> N[Postgres transaction<br/>blocks/logs/checkpoint]
-    N -. M6 future .-> O[Kafka outbox dispatcher]
+    M -. durable sink .-> N[Postgres transaction<br/>blocks/logs/checkpoint]
+    N -. outbox delivery .-> O[Kafka outbox dispatcher]
 ```

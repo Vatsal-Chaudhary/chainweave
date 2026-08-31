@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT TRUE AS present\n            FROM blocks\n            WHERE chain_id = ($1::text)::numeric\n              AND block_hash = $2\n              AND height = $3\n              AND is_canonical\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "present",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9bcd8d49c7eee91e8fd41d947ef911ffacc4f6c73f37e81366bbc8da5447917f"
+}

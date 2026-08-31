@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO blocks (\n                chain_id, block_hash, parent_hash, height, timestamp,\n                is_canonical, status, status_source\n            )\n            VALUES (($1::text)::numeric, $2, $3, $4, $5, TRUE, $6, $7)\n            ON CONFLICT (chain_id, block_hash) DO UPDATE\n            SET is_canonical = TRUE,\n                timestamp = EXCLUDED.timestamp,\n                status = EXCLUDED.status,\n                status_source = EXCLUDED.status_source\n            WHERE blocks.is_canonical = FALSE\n            RETURNING height\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "height",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bytea",
+        "Int8",
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ceb23d9a398edd1e8b5aa00a8fb14ec98f4a4b50dcd286b26be0597d5e57a4b4"
+}
