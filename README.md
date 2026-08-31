@@ -46,3 +46,27 @@ CHAINWEAVE_TESTNET_RPC_URL=https://YOUR_TESTNET_RPC \
 ```
 
 The `chainweave-sink` crate provides fail-closed `/health` and `/ready` state plus a Prometheus `/metrics` handler. A long-running worker process will bind these in a later milestone; M0 only establishes and tests the server primitive.
+
+## M1 reorg flow
+
+The current M1 transition module is pure in-memory chain coordination. It proves ancestry, emits ordered canonicality transitions, and leaves durable writes/outbox delivery for later milestones.
+
+```mermaid
+flowchart TD
+    A[Observed new head] --> B{Parent matches current tip?}
+    B -->|yes| C[Apply new head]
+    B -->|no| D[Walk replacement ancestry]
+    D --> E{Header in recent cache?}
+    E -->|yes| F[Validate parent link]
+    E -->|no| G[Resolver fetch by hash<br/>RPC fallback]
+    G --> F
+    F --> H{Reached canonical ancestor?}
+    H -->|local or persisted lookup| I[Proven common ancestor]
+    H -->|no| D
+    H -->|max depth/finality crossed| J[Fail closed]
+    I --> K[Rollback orphaned blocks<br/>descendant first]
+    K --> L[Apply replacement branch<br/>ancestor first]
+    L --> M[Return ChainEvent batch]
+    M -. M2 future .-> N[Postgres transaction<br/>blocks/logs/checkpoint]
+    N -. M6 future .-> O[Kafka outbox dispatcher]
+```
