@@ -8,9 +8,11 @@ rust-version.workspace = true
 [dependencies]
 alloy.workspace = true
 chainweave-core = { path = "../chainweave-core" }
+chainweave-sink = { path = "../chainweave-sink" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 url.workspace = true
 
 [dev-dependencies]

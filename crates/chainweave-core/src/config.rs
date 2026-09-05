@@ -201,10 +201,15 @@ fn validate_database_url(value: &str) -> Result<(), ConfigError> {
     if !matches!(url.scheme(), "postgres" | "postgresql") {
         return Err(invalid("database_url must use postgres or postgresql"));
     }
-    if url.password().is_none_or(str::is_empty) {
+    if url.password().is_none_or(str::is_empty) && !uses_local_socket(&url) {
         return Err(invalid("database_url must include a password"));
     }
     Ok(())
+}
+
+fn uses_local_socket(url: &Url) -> bool {
+    url.query_pairs()
+        .any(|(key, value)| key == "host" && value.starts_with('/'))
 }
 
 fn validate_hash(value: &str) -> Result<(), ConfigError> {
@@ -266,6 +271,9 @@ mod tests {
         config.database_url = Some("postgres://db.example.com/chainweave".to_owned());
         let error = config.validate(ValidationProfile::Workers).unwrap_err();
         assert!(error.to_string().contains("must include a password"));
+
+        config.database_url = Some("postgresql://vatsal@localhost/postgres?host=/tmp".to_owned());
+        config.validate(ValidationProfile::Workers).unwrap();
     }
 
     #[test]

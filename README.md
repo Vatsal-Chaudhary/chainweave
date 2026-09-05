@@ -30,6 +30,21 @@ cargo run -p chainweave-cli -- \
 
 Configuration precedence is defaults, optional TOML, `CHAINWEAVE_*` environment variables, then CLI flags. Nested environment keys use a double underscore, for example `CHAINWEAVE_RPC__PRIMARY_URL`. Database credentials should be supplied with `CHAINWEAVE_DATABASE_URL`; secrets do not belong in committed TOML files.
 
+## Historical Backfill
+
+Execute a bounded historical backfill range with explicit inclusive block bounds:
+
+```bash
+CHAINWEAVE_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+cargo run -p chainweave-cli -- \
+  --rpc-url http://127.0.0.1:8545 \
+  backfill --from-block 100 --to-block 200
+```
+
+The command validates worker configuration, requires `database_url`, captures the target head before fetching, verifies any configured chain identity, runs migrations, records or verifies database chain identity, fetches bounded `eth_getLogs` ranges plus each block header/body by number, validates parent continuity and log block hashes, and commits ranges through the M3 ordered coordinator into the existing M2 transactional Postgres writer.
+
+This is intentionally a small execution slice. It supports deterministic fixture coverage and small real backfills; the 50k pinned testnet acceptance run, adaptive production range resizing, and backfill/live handoff into M4 streaming are still pending.
+
 ## Tests
 
 The default suite uses deterministic in-process fixtures and does not depend on a public RPC or local Postgres:

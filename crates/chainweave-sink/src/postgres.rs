@@ -5,7 +5,10 @@ use std::{
     time::Duration,
 };
 
-use chainweave_core::{BlockHash, BlockHeader, ChainBatch, ChainEvent, ChainTransition};
+use chainweave_core::{
+    AsyncRangeCommitSink, BlockHash, BlockHeader, ChainBatch, ChainEvent, ChainTransition,
+    FetchedRange,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -81,6 +84,13 @@ pub struct OutboxEvent {
 pub struct PostgresChainWriter {
     pool: PgPool,
     chain_id: String,
+}
+
+#[derive(Debug)]
+pub struct PostgresBackfillCommitter {
+    writer: PostgresChainWriter,
+    parent_anchor: Option<BlockHeader>,
+    last_committed_hash: Option<BlockHash>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -889,6 +899,61 @@ impl PostgresChainWriter {
     }
 }
 
+impl PostgresBackfillCommitter {
+    #[must_use]
+    pub const fn new(writer: PostgresChainWriter, parent_anchor: Option<BlockHeader>) -> Self {
+        Self {
+            writer,
+            parent_anchor,
+            last_committed_hash: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn last_committed_hash(&self) -> Option<BlockHash> {
+        self.last_committed_hash
+    }
+}
+
+impl AsyncRangeCommitSink<IndexedBlock> for PostgresBackfillCommitter {
+    type Error = String;
+
+    async fn commit_range(
+        &mut self,
+        fetched: FetchedRange<IndexedBlock>,
+    ) -> Result<(), Self::Error> {
+        let headers = fetched.headers;
+        let blocks = fetched.logs;
+        let last_header = headers
+            .last()
+            .copied()
+            .ok_or_else(|| "cannot commit empty fetched range".to_owned())?;
+        let events = headers
+            .into_iter()
+            .map(ChainEvent::Apply)
+            .collect::<Vec<_>>();
+        let transition = if self.parent_anchor.is_some() {
+            ChainTransition::Gap
+        } else {
+            ChainTransition::Bootstrap
+        };
+        let batch = ChainBatch {
+            transition,
+            common_ancestor: self.parent_anchor,
+            events,
+        };
+        let durable = DurableChainBatch::from_chain_batch(&batch, blocks)
+            .map_err(|error| error.to_string())?;
+        self.writer
+            .apply_batch(&durable)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.parent_anchor = Some(last_header);
+        self.last_committed_hash = Some(last_header.hash);
+        Ok(())
+    }
+}
+
 impl SerializedWriter {
     /// Starts one serialized writer task for a chain.
     #[must_use]
@@ -1108,7 +1173,7 @@ fn hex_hash(hash: &BlockHash) -> String {
 mod tests {
     use std::{env, process::Command, str::FromStr as _, time::Duration};
 
-    use chainweave_core::{BlockHeader, ChainTransition};
+    use chainweave_core::{BackfillRange, BlockHeader, ChainTransition, OrderedCommitCoordinator};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     use super::*;
@@ -1339,6 +1404,37 @@ mod tests {
             db.writer.checkpoint().await.unwrap().unwrap().last_height,
             1
         );
+        assert_checkpoint_references_canonical_block(&db.writer).await;
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn backfill_committer_writes_small_range_through_existing_writer() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        let range = BackfillRange::new(0, 2).unwrap();
+        let headers = vec![header(0, 0), header(1, 0), header(2, 1)];
+        let blocks = vec![block(0, 0), block(1, 0), block(2, 1)];
+        let fetched = FetchedRange::new(range, headers, blocks).unwrap();
+        let mut coordinator = OrderedCommitCoordinator::new(0, 2, None).unwrap();
+        let mut committer = PostgresBackfillCommitter::new(db.writer.clone(), None);
+
+        let progress = coordinator
+            .push_async(fetched, &mut committer)
+            .await
+            .unwrap();
+
+        assert_eq!(progress.committed_ranges, 1);
+        assert_eq!(progress.committed_blocks, 3);
+        assert_eq!(progress.last_committed_height, Some(2));
+        assert_eq!(committer.last_committed_hash(), Some(hash(2)));
+        let checkpoint = db.writer.checkpoint().await.unwrap().unwrap();
+        assert_eq!(checkpoint.last_height, 2);
+        assert_eq!(checkpoint.last_hash, hash(2));
+        assert_eq!(db.writer.canonical_logs().await.unwrap().len(), 3);
+        assert_eq!(db.writer.outbox_events().await.unwrap().len(), 3);
         assert_checkpoint_references_canonical_block(&db.writer).await;
         db.cleanup().await;
     }

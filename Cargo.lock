@@ -1405,9 +1405,11 @@ dependencies = [
  "alloy",
  "axum",
  "chainweave-core",
+ "chainweave-sink",
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "tokio",
  "url",
 ]
