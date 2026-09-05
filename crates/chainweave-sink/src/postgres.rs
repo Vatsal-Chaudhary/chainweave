@@ -87,6 +87,7 @@ pub struct PostgresChainWriter {
 pub enum CrashPoint {
     BeforeCommit,
     AfterCommit,
+    TransactionStep(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -173,6 +174,11 @@ struct RawLogRow {
     data: Vec<u8>,
     decoded_event: Option<Value>,
     decoder_version: Option<String>,
+}
+
+struct CrashGate {
+    crash_point: CrashPoint,
+    step: u32,
 }
 
 #[derive(Debug, Error)]
@@ -368,10 +374,13 @@ impl PostgresChainWriter {
         }
 
         let mut tx = self.pool.begin().await?;
+        let mut crash_gate = crash_point.map(CrashGate::new);
+        crash_gate_hit(&mut crash_gate).await;
         let mut report = ApplyReport::default();
         let mut checkpoint_target = batch.common_ancestor;
 
         for event in &batch.events {
+            crash_gate_hit(&mut crash_gate).await;
             match event {
                 DurableChainEvent::Rollback(header) => {
                     if self.rollback_block(&mut tx, *header).await? {
@@ -395,10 +404,13 @@ impl PostgresChainWriter {
                     checkpoint_target = Some(block.header);
                 }
             }
+            crash_gate_hit(&mut crash_gate).await;
         }
 
         if let Some(target) = checkpoint_target {
+            crash_gate_hit(&mut crash_gate).await;
             self.move_checkpoint(&mut tx, target).await?;
+            crash_gate_hit(&mut crash_gate).await;
         }
 
         if crash_point == Some(CrashPoint::BeforeCommit) {
@@ -969,6 +981,28 @@ async fn pending_crash() {
     std::future::pending::<()>().await;
 }
 
+impl CrashGate {
+    const fn new(crash_point: CrashPoint) -> Self {
+        Self {
+            crash_point,
+            step: 0,
+        }
+    }
+
+    async fn hit(&mut self) {
+        if self.crash_point == CrashPoint::TransactionStep(self.step) {
+            pending_crash().await;
+        }
+        self.step += 1;
+    }
+}
+
+async fn crash_gate_hit(crash_gate: &mut Option<CrashGate>) {
+    if let Some(gate) = crash_gate {
+        gate.hit().await;
+    }
+}
+
 fn row_to_checkpoint(
     last_height: i64,
     last_hash: Vec<u8>,
@@ -1087,6 +1121,13 @@ mod tests {
         writer: PostgresChainWriter,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct DurableStateSnapshot {
+        checkpoint: Option<Checkpoint>,
+        canonical_logs: Vec<RawLog>,
+        semantic_outbox: Vec<(String, BlockHash, u64)>,
+    }
+
     #[tokio::test]
     async fn idempotent_replay_leaves_same_canonical_state_and_outbox() {
         let Some(db) = TestDb::create().await else {
@@ -1111,6 +1152,7 @@ mod tests {
         assert_eq!(first_checkpoint.unwrap().last_height, 2);
         assert_eq!(first_logs.len(), 3);
         assert_eq!(first_outbox.len(), 3);
+        assert_checkpoint_references_canonical_block(&db.writer).await;
         db.cleanup().await;
     }
 
@@ -1215,27 +1257,43 @@ mod tests {
             .map(|log| log.tx_hash[0])
             .collect::<Vec<_>>();
         assert_eq!(canonical_tx_hashes, vec![40, 41, 52, 53, 54]);
+        assert_checkpoint_references_canonical_block(&db.writer).await;
         db.cleanup().await;
     }
 
     #[tokio::test]
-    async fn kill_restart_crash_recovery_matches_clean_replay() {
-        let Some(db) = TestDb::create().await else {
+    async fn randomized_kill_restart_crash_recovery_matches_clean_replay() {
+        let Some(clean_db) = TestDb::create().await else {
             return;
         };
-        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
-        run_crash_child(&db, "before_commit").await;
-        assert!(db.writer.checkpoint().await.unwrap().is_none());
-        assert!(db.writer.outbox_events().await.unwrap().is_empty());
-
         let clean_batch = crash_batch();
-        db.writer.apply_batch(&clean_batch).await.unwrap();
-        let clean_checkpoint = db.writer.checkpoint().await.unwrap();
-        let clean_logs = db.writer.canonical_logs().await.unwrap();
-        let clean_outbox = db.writer.outbox_events().await.unwrap();
+        clean_db
+            .writer
+            .ensure_chain_identity(hash(90))
+            .await
+            .unwrap();
+        clean_db.writer.apply_batch(&clean_batch).await.unwrap();
+        let clean_state = durable_state_snapshot(&clean_db.writer).await;
+
+        for step in randomized_crash_steps() {
+            let Some(db) = TestDb::create().await else {
+                clean_db.cleanup().await;
+                return;
+            };
+            db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+            run_crash_child(&db, &format!("step:{step}")).await;
+            assert!(db.writer.checkpoint().await.unwrap().is_none());
+            assert!(db.writer.outbox_events().await.unwrap().is_empty());
+
+            db.writer.apply_batch(&clean_batch).await.unwrap();
+
+            assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+            assert_checkpoint_references_canonical_block(&db.writer).await;
+            db.cleanup().await;
+        }
 
         let Some(after_commit_db) = TestDb::create().await else {
-            db.cleanup().await;
+            clean_db.cleanup().await;
             return;
         };
         after_commit_db
@@ -1251,19 +1309,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            after_commit_db.writer.checkpoint().await.unwrap(),
-            clean_checkpoint
-        );
-        assert_eq!(
-            after_commit_db.writer.canonical_logs().await.unwrap(),
-            clean_logs
-        );
-        assert_eq!(
-            semantic_outbox(after_commit_db.writer.outbox_events().await.unwrap()),
-            semantic_outbox(clean_outbox)
+            durable_state_snapshot(&after_commit_db.writer).await,
+            clean_state
         );
         assert_checkpoint_references_canonical_block(&after_commit_db.writer).await;
-        db.cleanup().await;
+        clean_db.cleanup().await;
         after_commit_db.cleanup().await;
     }
 
@@ -1289,6 +1339,7 @@ mod tests {
             db.writer.checkpoint().await.unwrap().unwrap().last_height,
             1
         );
+        assert_checkpoint_references_canonical_block(&db.writer).await;
         db.cleanup().await;
     }
 
@@ -1304,6 +1355,14 @@ mod tests {
         let crash_point = match mode.as_str() {
             "before_commit" => CrashPoint::BeforeCommit,
             "after_commit" => CrashPoint::AfterCommit,
+            step if step.starts_with("step:") => {
+                let step = step
+                    .strip_prefix("step:")
+                    .unwrap()
+                    .parse()
+                    .expect("crash step must be an unsigned integer");
+                CrashPoint::TransactionStep(step)
+            }
             other => panic!("unknown crash helper mode {other}"),
         };
         writer
@@ -1314,8 +1373,7 @@ mod tests {
 
     impl TestDb {
         async fn create() -> Option<Self> {
-            let Ok(database_url) = env::var("CHAINWEAVE_TEST_DATABASE_URL") else {
-                eprintln!("skipping Postgres integration test: CHAINWEAVE_TEST_DATABASE_URL unset");
+            let Some(database_url) = postgres_database_url() else {
                 return None;
             };
             let admin_pool = PgPoolOptions::new()
@@ -1413,6 +1471,14 @@ mod tests {
         assert!(!status.success());
     }
 
+    async fn durable_state_snapshot(writer: &PostgresChainWriter) -> DurableStateSnapshot {
+        DurableStateSnapshot {
+            checkpoint: writer.checkpoint().await.unwrap(),
+            canonical_logs: writer.canonical_logs().await.unwrap(),
+            semantic_outbox: semantic_outbox(writer.outbox_events().await.unwrap()),
+        }
+    }
+
     async fn assert_checkpoint_references_canonical_block(writer: &PostgresChainWriter) {
         let count: i64 = sqlx::query_scalar(
             r"
@@ -1438,6 +1504,50 @@ mod tests {
             .into_iter()
             .map(|event| (event.event_kind, event.block_hash, event.block_height))
             .collect()
+    }
+
+    fn postgres_database_url() -> Option<String> {
+        match env::var("CHAINWEAVE_TEST_DATABASE_URL") {
+            Ok(database_url) => Some(database_url),
+            Err(_) if postgres_tests_required() => {
+                panic!(
+                    "CHAINWEAVE_TEST_DATABASE_URL must be set when Postgres tests are required; run `make test-postgres-state` for the required Postgres suite"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "skipping Postgres integration test: CHAINWEAVE_TEST_DATABASE_URL unset; run `make test-postgres-state` for the required Postgres suite"
+                );
+                None
+            }
+        }
+    }
+
+    fn postgres_tests_required() -> bool {
+        env_flag("CHAINWEAVE_REQUIRE_POSTGRES_TESTS") || env_flag("CI")
+    }
+
+    fn env_flag(name: &str) -> bool {
+        env::var(name).is_ok_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    fn randomized_crash_steps() -> [u32; 8] {
+        const TX_CRASH_STEP_COUNT: u64 = 9;
+        let mut seed: u64 = env::var("CHAINWEAVE_CRASH_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0xC0FF_EE12_3456_7890);
+        let mut steps = [0; 8];
+        for step in &mut steps {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            *step = (seed % TX_CRASH_STEP_COUNT) as u32;
+        }
+        steps
     }
 
     fn crash_batch() -> DurableChainBatch {
