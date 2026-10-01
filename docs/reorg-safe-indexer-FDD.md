@@ -254,7 +254,7 @@ Each milestone should ship with tests and a short demo (CLI output / log trace) 
 - Alloy WS subscription for low-latency head wakeups, with ordered `watch_canonical_*_from`/polling or explicit range reconciliation from the durable checkpoint
 - On WS disconnect, reconnect with jittered backoff, query the current head, and fetch every missing height; never assume notifications are complete
 - Bounded `mpsc` channels between fetch → coordinate → decode → write stages with documented capacities, blocking policy, timeouts, and supervised task failure behavior
-- Optional secondary provider verifies chain identity, height lag, and recent hashes. Disagreement raises health/metrics alerts and pauses if configured; v1 does not silently fail over or vote on fork choice
+- Optional secondary provider verifies chain identity, height lag, and recent hashes. Disagreement raises health/metrics alerts and degrades readiness; verifier pause policy is deferred, and v1 does not silently fail over or vote on fork choice
 - **Acceptance:** deterministic tests drop, duplicate, and reorder head notifications and force reconnects without losing a block. Then run against a live testnet for 24h: zero unreconciled gaps, zero panics, bounded queue depth, and RSS remaining within a stated bound after warm-up.
 
 ### M5 — Pluggable ABI Decoding

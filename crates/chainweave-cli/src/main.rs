@@ -9,7 +9,10 @@ use chainweave_core::{
     FetchedRange, LogRangeSizer, OrderedCommitCoordinator, RetryDecision, RetryPolicy, RpcBudget,
     RpcFailure, RpcMethod, ValidationProfile,
 };
-use chainweave_rpc::{AnchoredRawLog, ContractLogFilter, RpcClient, RpcError};
+use chainweave_rpc::{
+    AnchoredRawLog, ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
+    classify_rpc_error, fetch_header_by_number_with_retry,
+};
 use chainweave_sink::{IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter};
 use clap::{Parser, Subcommand};
 use tokio::task::JoinSet;
@@ -607,69 +610,6 @@ async fn fetch_range_with_retry(
     FetchedRange::new(range, headers, blocks).map_err(FetchRangeError::Backfill)
 }
 
-async fn capture_target_head_with_retry(
-    client: &RpcClient,
-    retry_policy: RetryPolicy,
-    rpc_timeout: Duration,
-) -> Result<chainweave_rpc::ChainHead, RpcError> {
-    let mut attempt = 1;
-    loop {
-        match tokio::time::timeout(rpc_timeout, client.capture_target_head()).await {
-            Ok(Ok(head)) => return Ok(head),
-            Ok(Err(error)) => match retry_policy.decision(classify_rpc_error(&error), attempt) {
-                RetryDecision::RetryAfter(delay) => {
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                RetryDecision::GiveUp => return Err(error),
-            },
-            Err(_) => match retry_policy.decision(RpcFailure::Timeout, attempt) {
-                RetryDecision::RetryAfter(delay) => {
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                RetryDecision::GiveUp => {
-                    return Err(RpcError::Request(
-                        "timed out while capturing target head".to_owned(),
-                    ));
-                }
-            },
-        }
-    }
-}
-
-async fn fetch_header_by_number_with_retry(
-    client: &RpcClient,
-    height: u64,
-    retry_policy: RetryPolicy,
-    rpc_timeout: Duration,
-) -> Result<chainweave_core::BlockHeader, RpcError> {
-    let mut attempt = 1;
-    loop {
-        match tokio::time::timeout(rpc_timeout, client.fetch_header_by_number(height)).await {
-            Ok(Ok(header)) => return Ok(header),
-            Ok(Err(error)) => match retry_policy.decision(classify_rpc_error(&error), attempt) {
-                RetryDecision::RetryAfter(delay) => {
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                RetryDecision::GiveUp => return Err(error),
-            },
-            Err(_) => match retry_policy.decision(RpcFailure::Timeout, attempt) {
-                RetryDecision::RetryAfter(delay) => {
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                RetryDecision::GiveUp => {
-                    return Err(RpcError::Request(format!(
-                        "timed out fetching header at height {height}"
-                    )));
-                }
-            },
-        }
-    }
-}
-
 async fn fetch_logs_with_retry(
     client: &RpcClient,
     range: BackfillRange,
@@ -893,20 +833,6 @@ impl SharedRpcBudget {
             requests: budget.requests(),
             cost_units: budget.cost_units(),
         })
-    }
-}
-
-fn classify_rpc_error(error: &RpcError) -> RpcFailure {
-    match error {
-        RpcError::Request(message) => {
-            let classified = RpcFailure::from_rpc_message(message);
-            if matches!(classified, RpcFailure::Permanent) {
-                RpcFailure::Transient
-            } else {
-                classified
-            }
-        }
-        _ => RpcFailure::Permanent,
     }
 }
 
