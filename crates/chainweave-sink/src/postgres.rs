@@ -1318,6 +1318,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct DurableStateSnapshot {
         checkpoint: Option<Checkpoint>,
+        canonical_blocks: Vec<(BlockHash, u64)>,
         canonical_logs: Vec<RawLog>,
         semantic_outbox: Vec<(String, BlockHash, u64)>,
     }
@@ -1512,6 +1513,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_crash_before_commit_postgres_state_matches_clean_replay() {
+        let Some(clean_db) = TestDb::create().await else {
+            return;
+        };
+        let clean_batch = crash_batch();
+        clean_db
+            .writer
+            .ensure_chain_identity(hash(90))
+            .await
+            .unwrap();
+        clean_db.writer.apply_batch(&clean_batch).await.unwrap();
+        let clean_state = durable_state_snapshot(&clean_db.writer).await;
+
+        let Some(db) = TestDb::create().await else {
+            clean_db.cleanup().await;
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        run_crash_child(&db, "before_commit").await;
+        assert_eq!(durable_state_snapshot(&db.writer).await, empty_state());
+
+        db.writer.apply_batch(&clean_batch).await.unwrap();
+
+        assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+        assert_checkpoint_references_canonical_block(&db.writer).await;
+        clean_db.cleanup().await;
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn live_crash_after_commit_postgres_state_matches_clean_replay() {
+        let Some(clean_db) = TestDb::create().await else {
+            return;
+        };
+        let clean_batch = crash_batch();
+        clean_db
+            .writer
+            .ensure_chain_identity(hash(90))
+            .await
+            .unwrap();
+        clean_db.writer.apply_batch(&clean_batch).await.unwrap();
+        let clean_state = durable_state_snapshot(&clean_db.writer).await;
+
+        let Some(db) = TestDb::create().await else {
+            clean_db.cleanup().await;
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        run_crash_child(&db, "after_commit").await;
+        assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+
+        db.writer.apply_batch(&clean_batch).await.unwrap();
+
+        assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+        assert_checkpoint_references_canonical_block(&db.writer).await;
+        clean_db.cleanup().await;
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_drains_queued_batches() {
         let Some(db) = TestDb::create().await else {
             return;
@@ -1699,9 +1760,42 @@ mod tests {
     async fn durable_state_snapshot(writer: &PostgresChainWriter) -> DurableStateSnapshot {
         DurableStateSnapshot {
             checkpoint: writer.checkpoint().await.unwrap(),
+            canonical_blocks: canonical_block_rows(writer).await,
             canonical_logs: writer.canonical_logs().await.unwrap(),
             semantic_outbox: semantic_outbox(writer.outbox_events().await.unwrap()),
         }
+    }
+
+    fn empty_state() -> DurableStateSnapshot {
+        DurableStateSnapshot {
+            checkpoint: None,
+            canonical_blocks: Vec::new(),
+            canonical_logs: Vec::new(),
+            semantic_outbox: Vec::new(),
+        }
+    }
+
+    async fn canonical_block_rows(writer: &PostgresChainWriter) -> Vec<(BlockHash, u64)> {
+        let rows = sqlx::query(
+            r"
+            SELECT block_hash, height
+            FROM blocks
+            WHERE chain_id = $1::numeric AND is_canonical
+            ORDER BY height, block_hash
+            ",
+        )
+        .bind(&writer.chain_id)
+        .fetch_all(writer.pool())
+        .await
+        .unwrap();
+
+        rows.into_iter()
+            .map(|row| {
+                let hash = hash_from_vec(row.try_get("block_hash").unwrap()).unwrap();
+                let height = u64::try_from(row.try_get::<i64, _>("height").unwrap()).unwrap();
+                (hash, height)
+            })
+            .collect()
     }
 
     async fn assert_checkpoint_references_canonical_block(writer: &PostgresChainWriter) {

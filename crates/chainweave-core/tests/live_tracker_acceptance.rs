@@ -27,6 +27,11 @@ struct LiveOutcome {
     header_by_hash_calls: Vec<BlockHash>,
     log_block_hash_filters: Vec<BlockHash>,
     verifier_disagreements: u64,
+    readiness_transitions: Vec<Readiness>,
+    committed_before_fault: Vec<u64>,
+    partial_commits_before_recovery: u64,
+    manual_clock_advances: Vec<u64>,
+    shutdown_completed: bool,
     halted: Option<HaltReason>,
 }
 
@@ -61,6 +66,14 @@ struct LiveTestConfig {
     poll_interval_seconds: u64,
     queue_capacity: usize,
     explicit_start: Option<u64>,
+    finalized_height: Option<u64>,
+    clock: FakeClock,
+}
+
+#[derive(Debug, Clone)]
+struct FakeClock {
+    paused: bool,
+    window_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +101,8 @@ enum LiveFault {
     CrashBeforeCommit,
     CrashAfterCommit,
     ProviderDisagreement { height: u64 },
+    FinalizedBoundary { finalized_height: u64 },
+    ShutdownWithFullChannel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +116,7 @@ enum Readiness {
 enum HaltReason {
     MaxReorgDepth,
     MissingExplicitStart,
+    FinalizedBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +231,9 @@ fn reconnect_reconciles_from_durable_checkpoint_before_ready() {
 
     expect_live_outcome(
         scenario,
-        LiveOutcome::ready_at(block(&chain, 23).header).with_apply_order([21, 22, 23]),
+        LiveOutcome::ready_at(block(&chain, 23).header)
+            .with_apply_order([21, 22, 23])
+            .with_readiness_transitions([Readiness::Unavailable, Readiness::Ready]),
     );
 }
 
@@ -261,6 +279,7 @@ fn stale_rpc_below_checkpoint_with_matching_hash_makes_no_state_change() {
         scenario,
         LiveOutcome::degraded_at(block(&chain, 42).header)
             .with_canonical_heights([40, 41, 42])
+            .with_rollback_order([])
             .with_state_changes(0),
     );
 }
@@ -290,11 +309,11 @@ fn shorter_fork_with_different_hash_enters_chain_state() {
 #[test]
 fn reorg_injected_during_catch_up_exits_to_chain_state() {
     let old = linear_blocks(&[60, 61, 62, 63]);
-    let replacement = fork_from(block(&old, 61).header, &[162, 163]);
+    let replacement = fork_from(block(&old, 60).header, &[161, 162, 163]);
     let scenario = scenario_with_alt(
         "reorg during catch-up",
         "parent mismatch during catch-up discards uncommitted fetched work and switches to ChainState",
-        Some(block(&old, 61).header),
+        Some(block(&old, 60).header),
         old,
         replacement.clone(),
         vec![HeadEvent::Notify(block(&replacement, 63).header)],
@@ -303,7 +322,10 @@ fn reorg_injected_during_catch_up_exits_to_chain_state() {
 
     expect_live_outcome(
         scenario,
-        LiveOutcome::ready_at(block(&replacement, 63).header).with_apply_order([62, 63]),
+        LiveOutcome::ready_at(block(&replacement, 63).header)
+            .with_committed_before_fault([61])
+            .with_rollback_order([61])
+            .with_apply_order([61, 62, 63]),
     );
 }
 
@@ -418,7 +440,13 @@ fn live_budget_exhaustion_degrades_and_recovers_next_window() {
         scenario,
         LiveOutcome::ready_at(block(&chain, 112).header)
             .with_apply_order([111, 112])
-            .with_budget_recovery(),
+            .with_budget_recovery()
+            .with_readiness_transitions([
+                Readiness::Degraded,
+                Readiness::Unavailable,
+                Readiness::Ready,
+            ])
+            .with_manual_clock_advances([60]),
     );
 }
 
@@ -461,7 +489,8 @@ fn stage_panic_cancels_pipeline_and_recovers_from_checkpoint() {
         scenario,
         LiveOutcome::ready_at(block(&chain, 132).header)
             .with_apply_order([131, 132])
-            .with_panics(1),
+            .with_panics(1)
+            .with_no_partial_commit_before_recovery(),
     );
 }
 
@@ -552,6 +581,111 @@ fn live_without_checkpoint_requires_explicit_start() {
     );
 }
 
+#[test]
+fn same_height_tip_reorg_rolls_back_old_tip_and_applies_replacement() {
+    let old = linear_blocks(&[180, 181]);
+    let replacement = fork_from(block(&old, 180).header, &[281]);
+    let scenario = scenario_with_alt(
+        "same-height tip reorg",
+        "checkpoint height equals head height but hash differs, so ChainState rolls back and reapplies height H",
+        Some(block(&old, 181).header),
+        old,
+        replacement.clone(),
+        vec![HeadEvent::Notify(block(&replacement, 181).header)],
+        Vec::new(),
+    );
+
+    expect_live_outcome(
+        scenario,
+        LiveOutcome::ready_at(block(&replacement, 181).header)
+            .with_rollback_order([181])
+            .with_apply_order([181]),
+    );
+}
+
+#[test]
+fn reorg_crossing_finalized_boundary_halts_without_writes() {
+    let canonical = linear_blocks(&[190, 191, 192, 193]);
+    let replacement = fork_from(block(&canonical, 190).header, &[291, 292, 293]);
+    let scenario = scenario_with_config(
+        "finalized boundary reorg",
+        "a reorg crossing the finalized boundary halts without rollback, apply, or checkpoint movement",
+        Some(block(&canonical, 193).header),
+        canonical.clone(),
+        replacement.clone(),
+        vec![HeadEvent::Notify(block(&replacement, 193).header)],
+        vec![LiveFault::FinalizedBoundary {
+            finalized_height: 192,
+        }],
+        LiveTestConfig {
+            finalized_height: Some(192),
+            ..LiveTestConfig::default()
+        },
+    );
+
+    expect_live_outcome(
+        scenario,
+        LiveOutcome::halted_at(block(&canonical, 193).header, HaltReason::FinalizedBoundary)
+            .with_rollback_order([])
+            .with_apply_order([])
+            .with_state_changes(0),
+    );
+}
+
+#[test]
+fn shutdown_cancellation_with_full_channel_completes_without_hanging() {
+    let chain = linear_blocks(&[200, 201, 202, 203]);
+    let scenario = scenario_with_config(
+        "shutdown full channel",
+        "shutdown cancellation with a full bounded channel does not hang and preserves committed order",
+        Some(block(&chain, 200).header),
+        chain.clone(),
+        BTreeMap::new(),
+        vec![HeadEvent::Notify(block(&chain, 203).header)],
+        vec![LiveFault::ShutdownWithFullChannel],
+        LiveTestConfig {
+            queue_capacity: 1,
+            ..LiveTestConfig::default()
+        },
+    );
+
+    expect_live_outcome(
+        scenario,
+        LiveOutcome::ready_at(block(&chain, 203).header)
+            .with_apply_order([201, 202, 203])
+            .with_shutdown_completed(),
+    );
+}
+
+#[test]
+fn seeded_randomized_head_schedule_matches_clean_run() {
+    for seed in 0_u64..32 {
+        let chain = randomized_clean_chain(seed);
+        let final_height = *chain.keys().last().expect("randomized chain is nonempty");
+        let invariant = Box::leak(
+            format!(
+                "seed {seed}: random drops/duplicates/reorders/disconnects converge to the clean run final state"
+            )
+            .into_boxed_str(),
+        );
+        let scenario = scenario(
+            "seeded randomized schedule",
+            invariant,
+            Some(block(&chain, 0).header),
+            chain.clone(),
+            randomized_events(seed, &chain),
+            Vec::new(),
+        );
+
+        expect_live_outcome(
+            scenario,
+            LiveOutcome::ready_at(block(&chain, final_height).header)
+                .with_canonical_heights(chain.keys().copied())
+                .with_apply_order(1..=final_height),
+        );
+    }
+}
+
 fn expect_live_outcome(scenario: LiveScenario, expected: LiveOutcome) {
     let invariant = scenario.invariant;
     let actual = run_live_tracker(scenario);
@@ -577,6 +711,12 @@ fn consume_scenario(scenario: &LiveScenario) -> usize {
         + scenario.config.max_reorg_depth as usize
         + scenario.config.live_budget_cost_units_per_minute as usize
         + scenario.config.poll_interval_seconds as usize
+        + scenario
+            .config
+            .finalized_height
+            .map_or(0, |value| value as usize)
+        + scenario.config.clock.window_seconds as usize
+        + usize::from(scenario.config.clock.paused)
         + scenario
             .config
             .explicit_start
@@ -615,7 +755,10 @@ fn consume_scenario(scenario: &LiveScenario) -> usize {
             | LiveFault::ShorterForkAtCurrentHeight { height }
             | LiveFault::ReorgDuringCatchUp { at_height: height }
             | LiveFault::BlockHashLogMismatch { height }
-            | LiveFault::ProviderDisagreement { height } => *height as usize,
+            | LiveFault::ProviderDisagreement { height }
+            | LiveFault::FinalizedBoundary {
+                finalized_height: height,
+            } => *height as usize,
             LiveFault::UnknownParentRequiresHash(hash) => usize::from(hash[0]),
             LiveFault::TimeoutOnce(method) | LiveFault::RateLimitOnce(method) => {
                 method.default_cost() as usize
@@ -624,7 +767,8 @@ fn consume_scenario(scenario: &LiveScenario) -> usize {
             LiveFault::ExhaustLiveBudget
             | LiveFault::StallWriter
             | LiveFault::CrashBeforeCommit
-            | LiveFault::CrashAfterCommit => 1,
+            | LiveFault::CrashAfterCommit
+            | LiveFault::ShutdownWithFullChannel => 1,
         });
     }
     touched
@@ -761,6 +905,11 @@ impl Default for LiveTestConfig {
             poll_interval_seconds: 12,
             queue_capacity: 4,
             explicit_start: Some(0),
+            finalized_height: None,
+            clock: FakeClock {
+                paused: true,
+                window_seconds: 60,
+            },
         }
     }
 }
@@ -780,6 +929,11 @@ impl LiveOutcome {
             header_by_hash_calls: Vec::new(),
             log_block_hash_filters: Vec::new(),
             verifier_disagreements: 0,
+            readiness_transitions: Vec::new(),
+            committed_before_fault: Vec::new(),
+            partial_commits_before_recovery: 0,
+            manual_clock_advances: Vec::new(),
+            shutdown_completed: false,
             halted: None,
         }
     }
@@ -849,5 +1003,93 @@ impl LiveOutcome {
     fn with_verifier_disagreements(mut self, disagreements: u64) -> Self {
         self.verifier_disagreements = disagreements;
         self
+    }
+
+    fn with_readiness_transitions(
+        mut self,
+        transitions: impl IntoIterator<Item = Readiness>,
+    ) -> Self {
+        self.readiness_transitions = transitions.into_iter().collect();
+        self
+    }
+
+    fn with_committed_before_fault(mut self, heights: impl IntoIterator<Item = u64>) -> Self {
+        self.committed_before_fault = heights.into_iter().collect();
+        self
+    }
+
+    fn with_no_partial_commit_before_recovery(mut self) -> Self {
+        self.partial_commits_before_recovery = 0;
+        self
+    }
+
+    fn with_manual_clock_advances(mut self, seconds: impl IntoIterator<Item = u64>) -> Self {
+        self.manual_clock_advances = seconds.into_iter().collect();
+        self
+    }
+
+    fn with_shutdown_completed(mut self) -> Self {
+        self.shutdown_completed = true;
+        self
+    }
+}
+
+fn randomized_clean_chain(seed: u64) -> BTreeMap<u64, FakeBlock> {
+    let mut chain = BTreeMap::new();
+    let mut parent_value = 0;
+    chain.insert(0, fake_block(0, 0, 0));
+    let mut rng = DeterministicRng::new(seed);
+    for height in 1..=12 {
+        let value = height + (rng.next() % 3) * 100;
+        let block = fake_block(value, parent_value, height);
+        parent_value = value;
+        chain.insert(height, block);
+    }
+    chain
+}
+
+fn randomized_events(seed: u64, chain: &BTreeMap<u64, FakeBlock>) -> Vec<HeadEvent> {
+    let mut rng = DeterministicRng::new(seed ^ 0xA5A5_5A5A);
+    let mut events = Vec::new();
+    for height in 1..=12 {
+        let header = block(chain, height).header;
+        match rng.next() % 5 {
+            0 => events.push(HeadEvent::Drop(header)),
+            1 => {
+                events.push(HeadEvent::Notify(header));
+                events.push(HeadEvent::Duplicate(header));
+            }
+            2 if height > 2 => events.push(HeadEvent::Reorder(vec![
+                block(chain, height).header,
+                block(chain, height - 1).header,
+            ])),
+            3 => {
+                events.push(HeadEvent::Disconnect);
+                events.push(HeadEvent::Reconnect);
+                events.push(HeadEvent::Notify(header));
+            }
+            _ => events.push(HeadEvent::Notify(header)),
+        }
+    }
+    events
+}
+
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    const fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        self.state
     }
 }
