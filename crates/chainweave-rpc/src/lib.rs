@@ -1,3 +1,3 @@
 mod client;
 
-pub use client::{ChainHead, RpcClient, RpcError};
+pub use client::{AnchoredRawLog, ChainHead, ContractLogFilter, RpcClient, RpcError};

@@ -3,8 +3,8 @@ mod postgres;
 
 pub use observability::{HealthState, ObservabilityError, ObservabilityServer};
 pub use postgres::{
-    ApplyReport, BlockStatus, Checkpoint, CrashPoint, DurableChainBatch, DurableChainEvent,
-    IndexedBlock, OutboxEvent, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
-    RawLog, ReconciliationError, ReconciliationSource, ReconciliationSummary, SerializedWriter,
-    StatusSource, WriterQueueError, WriterShutdownError,
+    ApplyReport, BlockStatus, CanonicalRangeSummary, Checkpoint, CrashPoint, DurableChainBatch,
+    DurableChainEvent, IndexedBlock, NormalizedLogRecord, OutboxEvent, PostgresBackfillCommitter,
+    PostgresChainWriter, PostgresStateError, RawLog, ReconciliationError, ReconciliationSource,
+    ReconciliationSummary, SerializedWriter, StatusSource, WriterQueueError, WriterShutdownError,
 };

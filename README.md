@@ -41,9 +41,27 @@ cargo run -p chainweave-cli -- \
   backfill --from-block 100 --to-block 200
 ```
 
-The command validates worker configuration, requires `database_url`, captures the target head before fetching, verifies any configured chain identity, runs migrations, records or verifies database chain identity, fetches bounded `eth_getLogs` ranges plus each block header/body by number, validates parent continuity and log block hashes, and commits ranges through the M3 ordered coordinator into the existing M2 transactional Postgres writer.
+The command validates worker configuration, requires `database_url`, captures the target head before fetching, verifies any configured chain identity, runs migrations, records or verifies database chain identity, fetches adaptive bounded `eth_getLogs` ranges plus batched canonical blocks by number, validates parent continuity and log block hashes, and commits ranges through the M3 ordered coordinator into the existing M2 transactional Postgres writer.
 
-This is intentionally a small execution slice. It supports deterministic fixture coverage and small real backfills; the 50k pinned testnet acceptance run, adaptive production range resizing, and backfill/live handoff into M4 streaming are still pending.
+The M3 acceptance proof is repeatable with the pinned Sepolia WETH range:
+
+```bash
+make test-backfill-acceptance
+```
+
+The target starts a real Postgres instance, backfills blocks `11594001..=11644000` from `https://rpc.sepolia.ethpandaops.io`, filters contract `0xfff9976782d46cc05630d1f6ebab18b2324d6b14`, fetches an independent normalized reference dataset from `https://sepolia.gateway.tenderly.co`, and compares `(block_hash, tx_hash, log_index, address, topics, data)` records.
+
+Acceptance result from September 6, 2026:
+
+```text
+reference comparison: matched 19319 normalized records
+backfilled 11594001..=11644000 through height 11644000
+committed ranges: 500, blocks: 50000, log records: 19319, elapsed: 442.11s, throughput: 113.09 blocks/s
+canonical continuity: 50000 blocks from 11594001 through 11644000
+RPC budget used: 51001 requests / 55001 cost units (1020.02 calls per 1k blocks)
+```
+
+This remains bounded historical backfill work only. Live streaming, websocket subscriptions, live wakeups, ABI decoding, Kafka delivery, and production metrics are later milestones.
 
 ## Tests
 

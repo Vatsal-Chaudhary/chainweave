@@ -11,7 +11,7 @@ use chainweave_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{sync::mpsc, time::timeout};
@@ -42,6 +42,23 @@ pub struct RawLog {
     pub data: Vec<u8>,
     pub decoded_event: Option<Value>,
     pub decoder_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NormalizedLogRecord {
+    pub block_hash: BlockHash,
+    pub tx_hash: BlockHash,
+    pub log_index: u32,
+    pub address: [u8; 20],
+    pub topics: Vec<BlockHash>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRangeSummary {
+    pub canonical_blocks: u64,
+    pub min_height: Option<u64>,
+    pub max_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +762,113 @@ impl PostgresChainWriter {
         rows.into_iter().map(row_to_raw_log).collect()
     }
 
+    /// Returns normalized canonical records for M3 acceptance comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error or invalid stored byte lengths.
+    pub async fn canonical_log_records(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        address: Option<[u8; 20]>,
+    ) -> Result<Vec<NormalizedLogRecord>, PostgresStateError> {
+        let mut query = String::from(
+            r"
+            SELECT
+                logs.block_hash,
+                logs.tx_hash,
+                logs.log_index,
+                logs.address,
+                logs.topics,
+                logs.data
+            FROM logs
+            JOIN blocks
+              ON blocks.chain_id = logs.chain_id
+             AND blocks.block_hash = logs.block_hash
+            WHERE logs.chain_id = ($1::text)::numeric
+              AND blocks.is_canonical
+              AND logs.block_number >= $2
+              AND logs.block_number <= $3
+            ",
+        );
+        if address.is_some() {
+            query.push_str(" AND logs.address = $4 ");
+        }
+        query.push_str(" ORDER BY logs.block_number, logs.transaction_index, logs.log_index ");
+
+        let mut query = sqlx::query(&query)
+            .bind(&self.chain_id)
+            .bind(pg_height(from_block)?)
+            .bind(pg_height(to_block)?);
+        if let Some(address) = address {
+            query = query.bind(address_bytes(&address));
+        }
+
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(NormalizedLogRecord {
+                    block_hash: hash_from_vec(row.try_get("block_hash")?)?,
+                    tx_hash: hash_from_vec(row.try_get("tx_hash")?)?,
+                    log_index: u32::try_from(row.try_get::<i32, _>("log_index")?)
+                        .map_err(|_| PostgresStateError::IntOverflow(u32::MAX))?,
+                    address: address_from_vec(row.try_get("address")?)?,
+                    topics: row
+                        .try_get::<Vec<Vec<u8>>, _>("topics")?
+                        .into_iter()
+                        .map(hash_from_vec)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    data: row.try_get("data")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Summarizes canonical block coverage for an inclusive height range.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error or a conversion error for invalid stored heights.
+    pub async fn canonical_range_summary(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<CanonicalRangeSummary, PostgresStateError> {
+        let row = sqlx::query(
+            r"
+            SELECT COUNT(*) AS canonical_blocks, MIN(height) AS min_height, MAX(height) AS max_height
+            FROM blocks
+            WHERE chain_id = ($1::text)::numeric
+              AND is_canonical
+              AND height >= $2
+              AND height <= $3
+            ",
+        )
+        .bind(&self.chain_id)
+        .bind(pg_height(from_block)?)
+        .bind(pg_height(to_block)?)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(CanonicalRangeSummary {
+            canonical_blocks: u64::try_from(row.try_get::<i64, _>("canonical_blocks")?)
+                .map_err(|_| PostgresStateError::HeightOverflow(u64::MAX))?,
+            min_height: row
+                .try_get::<Option<i64>, _>("min_height")?
+                .map(|height| {
+                    u64::try_from(height).map_err(|_| PostgresStateError::HeightOverflow(u64::MAX))
+                })
+                .transpose()?,
+            max_height: row
+                .try_get::<Option<i64>, _>("max_height")?
+                .map(|height| {
+                    u64::try_from(height).map_err(|_| PostgresStateError::HeightOverflow(u64::MAX))
+                })
+                .transpose()?,
+        })
+    }
+
     /// Returns the append-only outbox transition journal.
     ///
     /// # Errors
@@ -912,6 +1036,11 @@ impl PostgresBackfillCommitter {
     #[must_use]
     pub const fn last_committed_hash(&self) -> Option<BlockHash> {
         self.last_committed_hash
+    }
+
+    #[must_use]
+    pub const fn writer(&self) -> &PostgresChainWriter {
+        &self.writer
     }
 }
 

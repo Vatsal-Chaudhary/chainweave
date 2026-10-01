@@ -1,10 +1,11 @@
 use alloy::{
     primitives::{Address, B256, Bytes},
     providers::{DynProvider, Provider, ProviderBuilder},
+    rpc::client::BatchRequest,
     rpc::types::BlockNumberOrTag,
 };
 use chainweave_core::{BackfillRange, BlockHeader, ChainIdentity, FetchedRange};
-use chainweave_sink::{BlockStatus, IndexedBlock, RawLog, StatusSource};
+use chainweave_sink::{BlockStatus, IndexedBlock, NormalizedLogRecord, RawLog, StatusSource};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::json;
 use thiserror::Error;
@@ -71,10 +72,16 @@ struct RpcLog {
     removed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractLogFilter {
+    address: Address,
+}
+
 #[derive(Debug, Clone)]
-struct AnchoredRawLog {
-    block_hash: [u8; 32],
-    raw: RawLog,
+pub struct AnchoredRawLog {
+    pub block_number: u64,
+    pub block_hash: [u8; 32],
+    pub raw: RawLog,
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +116,27 @@ pub enum RpcError {
     GenesisMismatch { expected: B256, actual: B256 },
     #[error("configured genesis hash is invalid: {0}")]
     InvalidGenesis(String),
+    #[error("contract address is invalid: {0}")]
+    InvalidAddress(String),
+}
+
+impl ContractLogFilter {
+    /// Parses and validates an EVM contract address for an `eth_getLogs` address filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::InvalidAddress`] when the input is not a 20-byte EVM address.
+    pub fn address(value: &str) -> Result<Self, RpcError> {
+        let address = value
+            .parse::<Address>()
+            .map_err(|error| RpcError::InvalidAddress(error.to_string()))?;
+        Ok(Self { address })
+    }
+
+    #[must_use]
+    pub fn address_bytes(self) -> [u8; 20] {
+        fixed_20(self.address)
+    }
 }
 
 impl RpcClient {
@@ -197,6 +225,22 @@ impl RpcClient {
         indexed_block_from_rpc(block, Vec::new())
     }
 
+    /// Fetches canonical blocks for an inclusive block range in one JSON-RPC batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the RPC request fails or any block/header response is incomplete.
+    pub async fn fetch_blocks_by_number(
+        &self,
+        range: BackfillRange,
+    ) -> Result<Vec<IndexedBlock>, RpcError> {
+        let blocks = self.fetch_rpc_blocks_by_number(range).await?;
+        blocks
+            .into_iter()
+            .map(|block| indexed_block_from_rpc(block, Vec::new()))
+            .collect()
+    }
+
     /// Fetches logs for an inclusive canonical block range.
     ///
     /// # Errors
@@ -204,11 +248,44 @@ impl RpcClient {
     /// Returns an error when the RPC request fails or a log lacks the identity fields required for
     /// idempotent durable writes.
     pub async fn fetch_logs(&self, range: BackfillRange) -> Result<Vec<RawLog>, RpcError> {
-        self.fetch_rpc_logs(range)
+        self.fetch_rpc_logs(range, None)
             .await?
             .into_iter()
             .map(|log| raw_log_from_rpc(log, range))
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Fetches logs for an inclusive canonical range with an optional contract-address filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the RPC request fails or a log lacks the identity fields required for
+    /// idempotent durable writes.
+    pub async fn fetch_anchored_logs(
+        &self,
+        range: BackfillRange,
+        filter: Option<ContractLogFilter>,
+    ) -> Result<Vec<AnchoredRawLog>, RpcError> {
+        self.fetch_rpc_logs(range, filter)
+            .await?
+            .into_iter()
+            .map(|log| anchored_raw_log_from_rpc(log, range))
+            .collect()
+    }
+
+    /// Fetches an independently normalized reference dataset for an inclusive range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `eth_getLogs` fails or a log is malformed.
+    pub async fn fetch_normalized_logs(
+        &self,
+        range: BackfillRange,
+        filter: Option<ContractLogFilter>,
+    ) -> Result<Vec<NormalizedLogRecord>, RpcError> {
+        self.fetch_anchored_logs(range, filter)
+            .await
+            .map(|logs| logs.into_iter().map(normalized_from_anchored).collect())
     }
 
     /// Fetches headers and logs for one bounded backfill range.
@@ -220,7 +297,35 @@ impl RpcClient {
         &self,
         range: BackfillRange,
     ) -> Result<FetchedRange<IndexedBlock>, RpcError> {
-        let mut logs_by_height = logs_by_height(self.fetch_rpc_logs(range).await?, range)?;
+        self.fetch_backfill_range_filtered(range, None).await
+    }
+
+    /// Fetches headers and logs for one bounded backfill range with an optional log filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any block or log request fails, or if fetched headers are not continuous.
+    pub async fn fetch_backfill_range_filtered(
+        &self,
+        range: BackfillRange,
+        filter: Option<ContractLogFilter>,
+    ) -> Result<FetchedRange<IndexedBlock>, RpcError> {
+        let logs = self.fetch_anchored_logs(range, filter).await?;
+        self.fetch_backfill_range_from_logs(range, logs).await
+    }
+
+    /// Fetches headers/bodies and attaches already fetched anchored logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any block request fails, if headers are not continuous, or if a log's
+    /// block hash disagrees with its fetched header.
+    pub async fn fetch_backfill_range_from_logs(
+        &self,
+        range: BackfillRange,
+        logs: Vec<AnchoredRawLog>,
+    ) -> Result<FetchedRange<IndexedBlock>, RpcError> {
+        let mut logs_by_height = logs_by_height(logs, range)?;
         let mut blocks = Vec::with_capacity(range.len() as usize);
         let mut headers = Vec::with_capacity(range.len() as usize);
         for height in range.from_block..=range.to_block {
@@ -286,11 +391,44 @@ impl RpcClient {
             .ok_or(RpcError::MissingBlockNumber(height))
     }
 
-    async fn fetch_rpc_logs(&self, range: BackfillRange) -> Result<Vec<RpcLog>, RpcError> {
-        let filter = json!({
+    async fn fetch_rpc_blocks_by_number(
+        &self,
+        range: BackfillRange,
+    ) -> Result<Vec<RpcBlock>, RpcError> {
+        let mut batch = BatchRequest::new(self.provider.client());
+        let mut waiters = Vec::with_capacity(range.len() as usize);
+        for height in range.from_block..=range.to_block {
+            let params = (BlockNumberOrTag::Number(height), false);
+            let waiter = batch
+                .add_call::<_, Option<RpcBlock>>("eth_getBlockByNumber", &params)
+                .map_err(request_error)?;
+            waiters.push((height, waiter));
+        }
+        batch.send().await.map_err(request_error)?;
+
+        let mut blocks = Vec::with_capacity(range.len() as usize);
+        for (height, waiter) in waiters {
+            let block = waiter
+                .await
+                .map_err(request_error)?
+                .ok_or(RpcError::MissingBlockNumber(height))?;
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    async fn fetch_rpc_logs(
+        &self,
+        range: BackfillRange,
+        contract_filter: Option<ContractLogFilter>,
+    ) -> Result<Vec<RpcLog>, RpcError> {
+        let mut filter = json!({
             "fromBlock": format_quantity(range.from_block),
             "toBlock": format_quantity(range.to_block),
         });
+        if let Some(contract_filter) = contract_filter {
+            filter["address"] = json!(contract_filter.address.to_string());
+        }
         self.provider
             .raw_request::<_, Vec<RpcLog>>("eth_getLogs".into(), (filter,))
             .await
@@ -361,6 +499,7 @@ fn anchored_raw_log_from_rpc(
     let data = log.data.as_ref().to_vec();
 
     Ok(AnchoredRawLog {
+        block_number,
         block_hash,
         raw: RawLog {
             transaction_index,
@@ -376,31 +515,38 @@ fn anchored_raw_log_from_rpc(
 }
 
 fn logs_by_height(
-    logs: Vec<RpcLog>,
+    logs: Vec<AnchoredRawLog>,
     range: BackfillRange,
 ) -> Result<std::collections::BTreeMap<u64, Vec<AnchoredRawLog>>, RpcError> {
     let mut grouped = std::collections::BTreeMap::new();
     for log in logs {
-        let block_number = log
-            .block_number
-            .ok_or(RpcError::MissingLogField("block_number"))?;
-        if !range.contains(block_number) {
+        if !range.contains(log.block_number) {
             return Err(RpcError::LogOutsideRange {
-                actual: block_number,
+                actual: log.block_number,
                 from_block: range.from_block,
                 to_block: range.to_block,
             });
         }
-        let raw = anchored_raw_log_from_rpc(log, range)?;
         grouped
-            .entry(block_number)
+            .entry(log.block_number)
             .or_insert_with(Vec::new)
-            .push(raw);
+            .push(log);
     }
     for logs in grouped.values_mut() {
         logs.sort_by_key(|log| (log.raw.transaction_index, log.raw.log_index));
     }
     Ok(grouped)
+}
+
+fn normalized_from_anchored(log: AnchoredRawLog) -> NormalizedLogRecord {
+    NormalizedLogRecord {
+        block_hash: log.block_hash,
+        tx_hash: log.raw.tx_hash,
+        log_index: log.raw.log_index,
+        address: log.raw.address,
+        topics: log.raw.topics,
+        data: log.raw.data,
+    }
 }
 
 fn required_u32(value: Option<u64>, field: &'static str) -> Result<u32, RpcError> {
@@ -555,6 +701,13 @@ mod tests {
     }
 
     async fn fixture_rpc(Json(request): Json<Value>) -> Json<Value> {
+        if let Some(batch) = request.as_array() {
+            return Json(Value::Array(batch.iter().map(fixture_response).collect()));
+        }
+        Json(fixture_response(&request))
+    }
+
+    fn fixture_response(request: &Value) -> Value {
         let method = request["method"].as_str().unwrap();
         let result = match method {
             "eth_chainId" => json!("0x7a69"),
@@ -585,11 +738,11 @@ mod tests {
             }
             _ => panic!("unexpected fixture RPC method: {method}"),
         };
-        Json(json!({
+        json!({
             "jsonrpc": "2.0",
             "id": request["id"],
             "result": result,
-        }))
+        })
     }
 
     fn block_response(height: &str) -> Value {

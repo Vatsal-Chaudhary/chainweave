@@ -1377,11 +1377,13 @@ name = "chainweave-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chainweave-core",
  "chainweave-rpc",
  "chainweave-sink",
  "clap",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

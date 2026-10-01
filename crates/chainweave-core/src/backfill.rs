@@ -181,14 +181,28 @@ impl RpcFailure {
     #[must_use]
     pub fn from_rpc_message(message: &str) -> Self {
         let lower = message.to_ascii_lowercase();
-        if lower.contains("too many requests") || lower.contains("rate limit") {
+        if lower.contains("too many requests")
+            || lower.contains("rate limit")
+            || lower.contains("rate-limit")
+            || lower.contains(" 429")
+            || lower.contains("status 429")
+        {
             Self::RateLimited { retry_after: None }
         } else if lower.contains("more than")
             || lower.contains("too many results")
             || lower.contains("response size")
             || lower.contains("block range")
+            || lower.contains("limit exceeded")
+            || lower.contains("query timeout exceeded")
         {
             Self::ProviderLimit
+        } else if lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("deadline")
+        {
+            Self::Timeout
+        } else if lower.contains("pruned history unavailable") {
+            Self::Transient
         } else {
             Self::Permanent
         }
