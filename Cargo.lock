@@ -1382,6 +1382,7 @@ dependencies = [
  "chainweave-rpc",
  "chainweave-sink",
  "clap",
+ "futures",
  "serde_json",
  "thiserror",
  "tokio",

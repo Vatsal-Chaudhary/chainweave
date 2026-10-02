@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    panic::AssertUnwindSafe,
     time::{Duration, Instant},
 };
 
@@ -14,8 +15,9 @@ use chainweave_rpc::{
 use chainweave_sink::{
     IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
 };
+use futures::FutureExt;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
@@ -514,6 +516,10 @@ pub enum LivePipelineError {
     StagePanicked(LivePipelineStage),
     #[error("live pipeline stage {0:?} was cancelled")]
     StageCancelled(LivePipelineStage),
+    #[error("live pipeline stage {0:?} exited before shutdown")]
+    StageExitedEarly(LivePipelineStage),
+    #[error("live pipeline supervisor task was cancelled")]
+    SupervisorCancelled,
     #[error("live pipeline queue capacity must be nonzero")]
     InvalidQueueCapacity,
 }
@@ -679,32 +685,60 @@ where
     }
 }
 
-pub struct SupervisedStage {
-    stage: LivePipelineStage,
-    handle: JoinHandle<Result<(), LivePipelineError>>,
+pub struct LivePipelineSupervisor {
+    shutdown: CancellationToken,
+    stages: JoinSet<(LivePipelineStage, Result<(), LivePipelineError>)>,
 }
 
-/// Spawns one supervised pipeline stage.
-pub fn spawn_supervised_stage<Fut>(stage: LivePipelineStage, future: Fut) -> SupervisedStage
-where
-    Fut: Future<Output = Result<(), LivePipelineError>> + Send + 'static,
-{
-    SupervisedStage {
-        stage,
-        handle: tokio::spawn(future),
+impl LivePipelineSupervisor {
+    #[must_use]
+    pub fn new(shutdown: CancellationToken) -> Self {
+        Self {
+            shutdown,
+            stages: JoinSet::new(),
+        }
     }
-}
 
-/// Waits for a supervised stage and converts task panics into correctness-visible pipeline errors.
-///
-/// # Errors
-///
-/// Returns the stage error, a panic marker, or a cancellation marker.
-pub async fn supervise_stage(stage: SupervisedStage) -> Result<(), LivePipelineError> {
-    match stage.handle.await {
-        Ok(result) => result,
-        Err(error) if error.is_panic() => Err(LivePipelineError::StagePanicked(stage.stage)),
-        Err(_) => Err(LivePipelineError::StageCancelled(stage.stage)),
+    pub fn spawn<Fut>(&mut self, stage: LivePipelineStage, future: Fut)
+    where
+        Fut: Future<Output = Result<(), LivePipelineError>> + Send + 'static,
+    {
+        self.stages.spawn(async move {
+            let result = AssertUnwindSafe(future).catch_unwind().await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => Err(LivePipelineError::StagePanicked(stage)),
+            };
+            (stage, result)
+        });
+    }
+
+    /// Waits for the first stage to finish, then cancels and drains the rest of the pipeline.
+    /// A clean stage exit before shutdown is treated as a pipeline failure because live stages
+    /// should run until cancellation or an explicit error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first stage error, panic, premature exit, or supervisor cancellation.
+    pub async fn run_until_first_exit(mut self) -> Result<(), LivePipelineError> {
+        let Some(joined) = self.stages.join_next().await else {
+            return Ok(());
+        };
+
+        let first_result = match joined {
+            Ok((_stage, Ok(()))) if self.shutdown.is_cancelled() => Ok(()),
+            Ok((stage, Ok(()))) => Err(LivePipelineError::StageExitedEarly(stage)),
+            Ok((_stage, Err(error))) => Err(error),
+            Err(error) if error.is_cancelled() => Err(LivePipelineError::SupervisorCancelled),
+            Err(error) if error.is_panic() => {
+                Err(LivePipelineError::StagePanicked(LivePipelineStage::Fetch))
+            }
+            Err(_) => Err(LivePipelineError::SupervisorCancelled),
+        };
+
+        self.shutdown.cancel();
+        while self.stages.join_next().await.is_some() {}
+        first_result
     }
 }
 
@@ -938,14 +972,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervised_stage_reports_panic_with_stage_name() {
-        let stage = spawn_supervised_stage(LivePipelineStage::Write, async {
-            panic!("writer stage panic is supervised");
+    async fn pipeline_supervisor_reports_upstream_panic_over_downstream_clean_exit() {
+        let shutdown = CancellationToken::new();
+        let (sender, mut receiver) = mpsc::channel::<u64>(1);
+        let mut supervisor = LivePipelineSupervisor::new(shutdown);
+
+        supervisor.spawn(LivePipelineStage::Fetch, async move {
+            drop(sender);
+            panic!("fetch stage panic is supervised");
+        });
+        supervisor.spawn(LivePipelineStage::Write, async move {
+            assert_eq!(receiver.recv().await, None);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(())
         });
 
         assert_eq!(
-            supervise_stage(stage).await,
-            Err(LivePipelineError::StagePanicked(LivePipelineStage::Write))
+            supervisor.run_until_first_exit().await,
+            Err(LivePipelineError::StagePanicked(LivePipelineStage::Fetch))
         );
     }
 }
