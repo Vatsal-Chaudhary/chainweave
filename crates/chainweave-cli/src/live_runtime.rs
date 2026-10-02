@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use chainweave_core::{
     BackfillRange, BlockHash, BlockHeader, FetchedRange, OrderedCommitCoordinator, RetryPolicy,
@@ -12,6 +15,8 @@ use chainweave_sink::{
     IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
 };
 use thiserror::Error;
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum LiveRuntimeError {
@@ -25,6 +30,8 @@ pub enum LiveRuntimeError {
     MissingCheckpointHeader(u64),
     #[error("invalid live RPC budget: {0}")]
     Budget(String),
+    #[error(transparent)]
+    Pipeline(#[from] LivePipelineError),
 }
 
 #[derive(Debug, Clone)]
@@ -484,9 +491,230 @@ fn saturating_duration_mul(duration: Duration, multiplier: u64) -> Duration {
     Duration::from_nanos(nanos as u64)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePipelineStage {
+    Fetch,
+    Coordinate,
+    RawPassThrough,
+    Write,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LivePipelineError {
+    #[error("live pipeline channel for {0:?} closed")]
+    ChannelClosed(LivePipelineStage),
+    #[error("live pipeline send from {stage:?} timed out after {timeout:?}")]
+    SendTimedOut {
+        stage: LivePipelineStage,
+        timeout: Duration,
+    },
+    #[error("live pipeline shutdown while {0:?} was waiting")]
+    Shutdown(LivePipelineStage),
+    #[error("live pipeline stage {0:?} panicked")]
+    StagePanicked(LivePipelineStage),
+    #[error("live pipeline stage {0:?} was cancelled")]
+    StageCancelled(LivePipelineStage),
+    #[error("live pipeline queue capacity must be nonzero")]
+    InvalidQueueCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivePipelineConfig {
+    pub fetch_queue: usize,
+    pub coordinate_queue: usize,
+    pub raw_queue: usize,
+    pub write_queue: usize,
+    pub send_timeout: Duration,
+}
+
+impl LivePipelineConfig {
+    #[must_use]
+    pub const fn new(
+        fetch_queue: usize,
+        coordinate_queue: usize,
+        raw_queue: usize,
+        write_queue: usize,
+        send_timeout: Duration,
+    ) -> Self {
+        Self {
+            fetch_queue,
+            coordinate_queue,
+            raw_queue,
+            write_queue,
+            send_timeout,
+        }
+    }
+}
+
+pub struct LivePipelineQueues<Fetch, Coordinate, Raw, Write> {
+    pub fetch_tx: mpsc::Sender<Fetch>,
+    pub fetch_rx: mpsc::Receiver<Fetch>,
+    pub coordinate_tx: mpsc::Sender<Coordinate>,
+    pub coordinate_rx: mpsc::Receiver<Coordinate>,
+    pub raw_tx: mpsc::Sender<Raw>,
+    pub raw_rx: mpsc::Receiver<Raw>,
+    pub write_tx: mpsc::Sender<Write>,
+    pub write_rx: mpsc::Receiver<Write>,
+}
+
+/// Builds the bounded live pipeline queues in fetch -> coordinate -> raw pass-through -> write
+/// order. Each queue must have an explicit nonzero capacity.
+///
+/// # Errors
+///
+/// Returns an error when any queue capacity is zero.
+pub fn bounded_live_pipeline_queues<Fetch, Coordinate, Raw, Write>(
+    config: LivePipelineConfig,
+) -> Result<LivePipelineQueues<Fetch, Coordinate, Raw, Write>, LivePipelineError> {
+    if config.fetch_queue == 0
+        || config.coordinate_queue == 0
+        || config.raw_queue == 0
+        || config.write_queue == 0
+    {
+        return Err(LivePipelineError::InvalidQueueCapacity);
+    }
+
+    let (fetch_tx, fetch_rx) = mpsc::channel(config.fetch_queue);
+    let (coordinate_tx, coordinate_rx) = mpsc::channel(config.coordinate_queue);
+    let (raw_tx, raw_rx) = mpsc::channel(config.raw_queue);
+    let (write_tx, write_rx) = mpsc::channel(config.write_queue);
+
+    Ok(LivePipelineQueues {
+        fetch_tx,
+        fetch_rx,
+        coordinate_tx,
+        coordinate_rx,
+        raw_tx,
+        raw_rx,
+        write_tx,
+        write_rx,
+    })
+}
+
+/// Sends one item to the next bounded stage, returning on shutdown or timeout instead of waiting
+/// forever behind a full queue.
+///
+/// # Errors
+///
+/// Returns a pipeline error when the queue closes, the send times out, or shutdown is requested.
+pub async fn send_with_shutdown<T>(
+    stage: LivePipelineStage,
+    sender: &mpsc::Sender<T>,
+    item: T,
+    timeout: Duration,
+    shutdown: &CancellationToken,
+) -> Result<(), LivePipelineError>
+where
+    T: Send + 'static,
+{
+    tokio::select! {
+        () = shutdown.cancelled() => Err(LivePipelineError::Shutdown(stage)),
+        result = tokio::time::timeout(timeout, sender.send(item)) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(LivePipelineError::ChannelClosed(stage)),
+            Err(_) => Err(LivePipelineError::SendTimedOut { stage, timeout }),
+        },
+    }
+}
+
+/// Runs the M4 raw decode stage as a strict pass-through. ABI decoding is intentionally deferred.
+///
+/// # Errors
+///
+/// Returns a pipeline error when shutdown, timeout, or downstream closure occurs.
+pub async fn raw_pass_through_stage<T>(
+    mut receiver: mpsc::Receiver<T>,
+    sender: mpsc::Sender<T>,
+    send_timeout: Duration,
+    shutdown: CancellationToken,
+) -> Result<(), LivePipelineError>
+where
+    T: Send + 'static,
+{
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Err(LivePipelineError::Shutdown(LivePipelineStage::RawPassThrough)),
+            item = receiver.recv() => {
+                let Some(item) = item else {
+                    return Ok(());
+                };
+                send_with_shutdown(
+                    LivePipelineStage::RawPassThrough,
+                    &sender,
+                    item,
+                    send_timeout,
+                    &shutdown,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+/// Runs the final write stage. This is the only pipeline stage that receives a mutating closure.
+///
+/// # Errors
+///
+/// Returns a pipeline error when shutdown is requested or the writer closure fails.
+pub async fn writer_stage<T, Write, WriteFuture>(
+    mut receiver: mpsc::Receiver<T>,
+    mut write: Write,
+    shutdown: CancellationToken,
+) -> Result<(), LivePipelineError>
+where
+    T: Send + 'static,
+    Write: FnMut(T) -> WriteFuture,
+    WriteFuture: Future<Output = Result<(), LivePipelineError>>,
+{
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Err(LivePipelineError::Shutdown(LivePipelineStage::Write)),
+            item = receiver.recv() => {
+                let Some(item) = item else {
+                    return Ok(());
+                };
+                write(item).await?;
+            }
+        }
+    }
+}
+
+pub struct SupervisedStage {
+    stage: LivePipelineStage,
+    handle: JoinHandle<Result<(), LivePipelineError>>,
+}
+
+/// Spawns one supervised pipeline stage.
+pub fn spawn_supervised_stage<Fut>(stage: LivePipelineStage, future: Fut) -> SupervisedStage
+where
+    Fut: Future<Output = Result<(), LivePipelineError>> + Send + 'static,
+{
+    SupervisedStage {
+        stage,
+        handle: tokio::spawn(future),
+    }
+}
+
+/// Waits for a supervised stage and converts task panics into correctness-visible pipeline errors.
+///
+/// # Errors
+///
+/// Returns the stage error, a panic marker, or a cancellation marker.
+pub async fn supervise_stage(stage: SupervisedStage) -> Result<(), LivePipelineError> {
+    match stage.handle.await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => Err(LivePipelineError::StagePanicked(stage.stage)),
+        Err(_) => Err(LivePipelineError::StageCancelled(stage.stage)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn windowed_live_budget_returns_delay_until_window_rollover() {
@@ -580,6 +808,144 @@ mod tests {
         assert_eq!(
             reconnect.record_availability_failure(),
             ReconnectAction::Halt
+        );
+    }
+
+    #[test]
+    fn bounded_pipeline_queues_use_configured_capacities() {
+        let queues: LivePipelineQueues<u64, u64, u64, u64> = bounded_live_pipeline_queues(
+            LivePipelineConfig::new(1, 2, 3, 4, Duration::from_millis(10)),
+        )
+        .unwrap();
+
+        assert_eq!(queues.fetch_tx.max_capacity(), 1);
+        assert_eq!(queues.coordinate_tx.max_capacity(), 2);
+        assert_eq!(queues.raw_tx.max_capacity(), 3);
+        assert_eq!(queues.write_tx.max_capacity(), 4);
+    }
+
+    #[test]
+    fn bounded_pipeline_rejects_zero_capacity() {
+        let result = bounded_live_pipeline_queues::<u64, u64, u64, u64>(LivePipelineConfig::new(
+            1,
+            0,
+            1,
+            1,
+            Duration::from_millis(10),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(LivePipelineError::InvalidQueueCapacity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_queue_send_times_out_with_stage_name() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(10_u64).await.unwrap();
+        let shutdown = CancellationToken::new();
+
+        let result = send_with_shutdown(
+            LivePipelineStage::Fetch,
+            &sender,
+            11_u64,
+            Duration::from_millis(1),
+            &shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(LivePipelineError::SendTimedOut {
+                stage: LivePipelineStage::Fetch,
+                timeout: Duration::from_millis(1)
+            })
+        );
+        assert_eq!(receiver.recv().await, Some(10));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_full_channel_send_without_hanging() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.send(10_u64).await.unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            send_with_shutdown(
+                LivePipelineStage::Coordinate,
+                &sender,
+                11_u64,
+                Duration::from_secs(60),
+                &shutdown,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            Err(LivePipelineError::Shutdown(LivePipelineStage::Coordinate))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_pass_through_preserves_event_order() {
+        let (raw_tx, raw_rx) = mpsc::channel(2);
+        let (write_tx, mut write_rx) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+
+        raw_tx.send(31_u64).await.unwrap();
+        raw_tx.send(32_u64).await.unwrap();
+        drop(raw_tx);
+
+        raw_pass_through_stage(raw_rx, write_tx, Duration::from_millis(50), shutdown)
+            .await
+            .unwrap();
+
+        assert_eq!(write_rx.recv().await, Some(31));
+        assert_eq!(write_rx.recv().await, Some(32));
+        assert_eq!(write_rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn writer_stage_is_the_only_mutating_stage() {
+        let (write_tx, write_rx) = mpsc::channel(2);
+        write_tx.send(41_u64).await.unwrap();
+        write_tx.send(42_u64).await.unwrap();
+        drop(write_tx);
+        let mutation_count = Arc::new(AtomicUsize::new(0));
+        let mutation_count_for_writer = Arc::clone(&mutation_count);
+
+        writer_stage(
+            write_rx,
+            move |item| {
+                let mutation_count = Arc::clone(&mutation_count_for_writer);
+                async move {
+                    assert!(item == 41 || item == 42);
+                    mutation_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mutation_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn supervised_stage_reports_panic_with_stage_name() {
+        let stage = spawn_supervised_stage(LivePipelineStage::Write, async {
+            panic!("writer stage panic is supervised");
+        });
+
+        assert_eq!(
+            supervise_stage(stage).await,
+            Err(LivePipelineError::StagePanicked(LivePipelineStage::Write))
         );
     }
 }
