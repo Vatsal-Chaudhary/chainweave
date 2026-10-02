@@ -34,6 +34,8 @@ pub enum LiveRuntimeError {
     Budget(String),
     #[error("invalid reconnect policy: {0}")]
     ReconnectPolicy(String),
+    #[error("invalid reconnect order: {0}")]
+    ReconnectOrder(String),
     #[error(transparent)]
     Pipeline(#[from] LivePipelineError),
 }
@@ -438,6 +440,8 @@ pub struct ReconnectLoop {
     readiness: RuntimeReadiness,
     halted: bool,
     healthy_since: Option<Instant>,
+    subscribed_to_wakeups: bool,
+    reconciled_after_subscribe: bool,
 }
 
 impl ReconnectLoop {
@@ -449,6 +453,8 @@ impl ReconnectLoop {
             readiness: RuntimeReadiness::Unavailable,
             halted: false,
             healthy_since: None,
+            subscribed_to_wakeups: false,
+            reconciled_after_subscribe: false,
         }
     }
 
@@ -475,11 +481,15 @@ impl ReconnectLoop {
         self.reset_backoff_if_min_healthy_elapsed(now);
         self.readiness = RuntimeReadiness::Unavailable;
         self.healthy_since = None;
+        self.subscribed_to_wakeups = false;
+        self.reconciled_after_subscribe = false;
     }
 
     pub fn record_connected_needs_reconciliation(&mut self) {
         self.readiness = RuntimeReadiness::Unavailable;
         self.healthy_since = None;
+        self.subscribed_to_wakeups = false;
+        self.reconciled_after_subscribe = false;
     }
 
     pub fn record_catch_up_complete(&mut self) {
@@ -493,6 +503,39 @@ impl ReconnectLoop {
         }
     }
 
+    pub fn record_subscribed_for_wakeups(&mut self) {
+        self.readiness = RuntimeReadiness::Unavailable;
+        self.healthy_since = None;
+        self.subscribed_to_wakeups = true;
+        self.reconciled_after_subscribe = false;
+    }
+
+    pub fn record_reconciled_to_head(&mut self) -> Result<(), LiveRuntimeError> {
+        if !self.subscribed_to_wakeups {
+            return Err(LiveRuntimeError::ReconnectOrder(
+                "must subscribe to head wakeups before reconciliation".to_owned(),
+            ));
+        }
+        self.readiness = RuntimeReadiness::Unavailable;
+        self.reconciled_after_subscribe = true;
+        Ok(())
+    }
+
+    pub fn record_ready_after_reconnect_at(
+        &mut self,
+        now: Instant,
+    ) -> Result<(), LiveRuntimeError> {
+        if !self.subscribed_to_wakeups || !self.reconciled_after_subscribe {
+            return Err(LiveRuntimeError::ReconnectOrder(
+                "must subscribe and reconcile before marking live tracker ready".to_owned(),
+            ));
+        }
+        self.subscribed_to_wakeups = false;
+        self.reconciled_after_subscribe = false;
+        self.record_catch_up_complete_at(now);
+        Ok(())
+    }
+
     #[must_use]
     pub fn record_availability_failure(&mut self) -> ReconnectAction {
         if self.halted {
@@ -500,6 +543,8 @@ impl ReconnectLoop {
         }
         self.readiness = RuntimeReadiness::Unavailable;
         self.healthy_since = None;
+        self.subscribed_to_wakeups = false;
+        self.reconciled_after_subscribe = false;
         self.attempt = self.attempt.saturating_add(1);
         ReconnectAction::RetryAfter(self.policy.delay_for_attempt(self.attempt))
     }
@@ -508,6 +553,8 @@ impl ReconnectLoop {
     pub fn record_correctness_error(&mut self) -> ReconnectAction {
         self.readiness = RuntimeReadiness::Unavailable;
         self.healthy_since = None;
+        self.subscribed_to_wakeups = false;
+        self.reconciled_after_subscribe = false;
         self.halted = true;
         ReconnectAction::Halt
     }
@@ -944,6 +991,36 @@ mod tests {
         reconnect.record_catch_up_complete();
         assert_eq!(reconnect.readiness(), RuntimeReadiness::Ready);
         assert_eq!(reconnect.attempts(), 0);
+    }
+
+    #[test]
+    fn reconnect_order_subscribes_then_reconciles_then_marks_ready() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+        let now = Instant::now();
+
+        assert!(matches!(
+            reconnect.record_reconciled_to_head(),
+            Err(LiveRuntimeError::ReconnectOrder(_))
+        ));
+
+        reconnect.record_subscribed_for_wakeups();
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+        assert!(matches!(
+            reconnect.record_ready_after_reconnect_at(now),
+            Err(LiveRuntimeError::ReconnectOrder(_))
+        ));
+
+        reconnect.record_reconciled_to_head().unwrap();
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+        reconnect.record_ready_after_reconnect_at(now).unwrap();
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Ready);
     }
 
     #[test]
