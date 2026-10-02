@@ -366,6 +366,7 @@ pub struct ReconnectPolicy {
     pub base_delay: Duration,
     pub max_delay: Duration,
     pub jitter: Duration,
+    pub min_healthy_duration: Duration,
 }
 
 impl ReconnectPolicy {
@@ -378,10 +379,16 @@ impl ReconnectPolicy {
         base_delay: Duration,
         max_delay: Duration,
         jitter: Duration,
+        min_healthy_duration: Duration,
     ) -> Result<Self, LiveRuntimeError> {
         if base_delay.is_zero() || max_delay.is_zero() {
             return Err(LiveRuntimeError::Budget(
                 "reconnect delays must be nonzero".to_owned(),
+            ));
+        }
+        if min_healthy_duration.is_zero() {
+            return Err(LiveRuntimeError::Budget(
+                "reconnect healthy duration must be nonzero".to_owned(),
             ));
         }
         if base_delay > max_delay {
@@ -393,6 +400,7 @@ impl ReconnectPolicy {
             base_delay,
             max_delay,
             jitter,
+            min_healthy_duration,
         })
     }
 
@@ -424,6 +432,7 @@ pub struct ReconnectLoop {
     attempt: u64,
     readiness: RuntimeReadiness,
     halted: bool,
+    healthy_since: Option<Instant>,
 }
 
 impl ReconnectLoop {
@@ -434,6 +443,7 @@ impl ReconnectLoop {
             attempt: 0,
             readiness: RuntimeReadiness::Unavailable,
             halted: false,
+            healthy_since: None,
         }
     }
 
@@ -453,17 +463,28 @@ impl ReconnectLoop {
     }
 
     pub fn record_disconnect(&mut self) {
+        self.record_disconnect_at(Instant::now());
+    }
+
+    pub fn record_disconnect_at(&mut self, now: Instant) {
+        self.reset_backoff_if_min_healthy_elapsed(now);
         self.readiness = RuntimeReadiness::Unavailable;
+        self.healthy_since = None;
     }
 
     pub fn record_connected_needs_reconciliation(&mut self) {
         self.readiness = RuntimeReadiness::Unavailable;
+        self.healthy_since = None;
     }
 
     pub fn record_catch_up_complete(&mut self) {
+        self.record_catch_up_complete_at(Instant::now());
+    }
+
+    pub fn record_catch_up_complete_at(&mut self, now: Instant) {
         if !self.halted {
-            self.attempt = 0;
             self.readiness = RuntimeReadiness::Ready;
+            self.healthy_since = Some(now);
         }
     }
 
@@ -473,6 +494,7 @@ impl ReconnectLoop {
             return ReconnectAction::Halt;
         }
         self.readiness = RuntimeReadiness::Unavailable;
+        self.healthy_since = None;
         self.attempt = self.attempt.saturating_add(1);
         ReconnectAction::RetryAfter(self.policy.delay_for_attempt(self.attempt))
     }
@@ -480,6 +502,7 @@ impl ReconnectLoop {
     #[must_use]
     pub fn record_correctness_error(&mut self) -> ReconnectAction {
         self.readiness = RuntimeReadiness::Unavailable;
+        self.healthy_since = None;
         self.halted = true;
         ReconnectAction::Halt
     }
@@ -489,6 +512,14 @@ impl ReconnectLoop {
         match error.classify() {
             LivePipelineErrorClass::Transient => self.record_availability_failure(),
             LivePipelineErrorClass::Correctness => self.record_correctness_error(),
+        }
+    }
+
+    fn reset_backoff_if_min_healthy_elapsed(&mut self, now: Instant) {
+        if self.healthy_since.is_some_and(|healthy_since| {
+            now.duration_since(healthy_since) >= self.policy.min_healthy_duration
+        }) {
+            self.attempt = 0;
         }
     }
 }
@@ -807,6 +838,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(10),
             Duration::from_millis(500),
+            Duration::from_secs(30),
         )
         .unwrap();
         let mut reconnect = ReconnectLoop::new(policy);
@@ -834,11 +866,51 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_backoff_resets_only_after_minimum_healthy_duration() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+        let start = Instant::now();
+
+        assert_eq!(
+            reconnect.record_availability_failure(),
+            ReconnectAction::RetryAfter(Duration::from_secs(1))
+        );
+        reconnect.record_catch_up_complete_at(start);
+        assert_eq!(reconnect.attempts(), 1);
+        reconnect.record_disconnect_at(start + Duration::from_secs(2));
+        assert_eq!(
+            reconnect.record_availability_failure(),
+            ReconnectAction::RetryAfter(Duration::from_secs(2))
+        );
+        reconnect.record_catch_up_complete_at(start + Duration::from_secs(3));
+        reconnect.record_disconnect_at(start + Duration::from_secs(4));
+        assert_eq!(
+            reconnect.record_availability_failure(),
+            ReconnectAction::RetryAfter(Duration::from_secs(4))
+        );
+
+        reconnect.record_catch_up_complete_at(start + Duration::from_secs(10));
+        reconnect.record_disconnect_at(start + Duration::from_secs(16));
+        assert_eq!(
+            reconnect.record_availability_failure(),
+            ReconnectAction::RetryAfter(Duration::from_secs(1))
+        );
+        assert_eq!(reconnect.attempts(), 1);
+    }
+
+    #[test]
     fn reconnect_readiness_stays_unavailable_until_catch_up_completes() {
         let policy = ReconnectPolicy::new(
             Duration::from_secs(1),
             Duration::from_secs(5),
             Duration::ZERO,
+            Duration::from_secs(30),
         )
         .unwrap();
         let mut reconnect = ReconnectLoop::new(policy);
@@ -859,6 +931,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(5),
             Duration::ZERO,
+            Duration::from_secs(30),
         )
         .unwrap();
         let mut reconnect = ReconnectLoop::new(policy);
@@ -878,6 +951,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(5),
             Duration::ZERO,
+            Duration::from_secs(30),
         )
         .unwrap();
         let mut reconnect = ReconnectLoop::new(policy);
