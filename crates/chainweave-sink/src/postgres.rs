@@ -1332,7 +1332,10 @@ fn hex_hash(hash: &BlockHash) -> String {
 mod tests {
     use std::{env, process::Command, str::FromStr as _, time::Duration};
 
-    use chainweave_core::{BackfillRange, BlockHeader, ChainTransition, OrderedCommitCoordinator};
+    use chainweave_core::{
+        AsyncRangeCommitSink, BackfillRange, BlockHeader, ChainBatch, ChainTransition,
+        OrderedCommitCoordinator,
+    };
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     use super::*;
@@ -1603,6 +1606,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_pipeline_restart_rebuilds_from_durable_checkpoint_after_precommit_kill() {
+        let Some(clean_db) = TestDb::create().await else {
+            return;
+        };
+        clean_db
+            .writer
+            .ensure_chain_identity(hash(90))
+            .await
+            .unwrap();
+        clean_db
+            .writer
+            .apply_batch(&batch(None, [apply_block(0, 0)]))
+            .await
+            .unwrap();
+        commit_live_height_from_durable_checkpoint(&clean_db.writer, 1).await;
+        let clean_state = durable_state_snapshot(&clean_db.writer).await;
+
+        let Some(db) = TestDb::create().await else {
+            clean_db.cleanup().await;
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        db.writer
+            .apply_batch(&batch(None, [apply_block(0, 0)]))
+            .await
+            .unwrap();
+        let seed_state = durable_state_snapshot(&db.writer).await;
+
+        run_crash_child(&db, "live_pipeline_before_commit").await;
+        assert_eq!(durable_state_snapshot(&db.writer).await, seed_state);
+
+        commit_live_height_from_durable_checkpoint(&db.writer, 1).await;
+
+        assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+        assert_checkpoint_references_canonical_block(&db.writer).await;
+        clean_db.cleanup().await;
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_drains_queued_batches() {
         let Some(db) = TestDb::create().await else {
             return;
@@ -1671,6 +1714,15 @@ mod tests {
         let crash_point = match mode.as_str() {
             "before_commit" => CrashPoint::BeforeCommit,
             "after_commit" => CrashPoint::AfterCommit,
+            "live_pipeline_before_commit" => {
+                commit_live_height_from_durable_checkpoint_with_crash(
+                    &writer,
+                    1,
+                    CrashPoint::BeforeCommit,
+                )
+                .await;
+                return;
+            }
             step if step.starts_with("step:") => {
                 let step = step
                     .strip_prefix("step:")
@@ -1785,6 +1837,98 @@ mod tests {
         child.kill().unwrap();
         let status = child.wait().unwrap();
         assert!(!status.success());
+    }
+
+    struct CrashBackfillCommitter {
+        writer: PostgresChainWriter,
+        parent_anchor: Option<BlockHeader>,
+        crash_point: CrashPoint,
+    }
+
+    impl AsyncRangeCommitSink<IndexedBlock> for CrashBackfillCommitter {
+        type Error = String;
+
+        async fn commit_range(
+            &mut self,
+            fetched: FetchedRange<IndexedBlock>,
+        ) -> Result<(), Self::Error> {
+            let headers = fetched.headers;
+            let blocks = fetched.logs;
+            let last_header = headers
+                .last()
+                .copied()
+                .ok_or_else(|| "cannot commit empty fetched range".to_owned())?;
+            let events = headers
+                .into_iter()
+                .map(ChainEvent::Apply)
+                .collect::<Vec<_>>();
+            let transition = if self.parent_anchor.is_some() {
+                ChainTransition::Gap
+            } else {
+                ChainTransition::Bootstrap
+            };
+            let batch = ChainBatch {
+                transition,
+                common_ancestor: self.parent_anchor,
+                events,
+            };
+            let durable = DurableChainBatch::from_chain_batch(&batch, blocks)
+                .map_err(|error| error.to_string())?;
+            self.writer
+                .apply_batch_with_crash_point(&durable, self.crash_point)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.parent_anchor = Some(last_header);
+            Ok(())
+        }
+    }
+
+    async fn commit_live_height_from_durable_checkpoint(writer: &PostgresChainWriter, height: u64) {
+        let anchor = durable_checkpoint_header(writer).await;
+        let mut coordinator = OrderedCommitCoordinator::new(height, height, Some(anchor)).unwrap();
+        let mut committer = PostgresBackfillCommitter::new(writer.clone(), Some(anchor));
+        coordinator
+            .push_async(live_fetched_height(height), &mut committer)
+            .await
+            .unwrap();
+    }
+
+    async fn commit_live_height_from_durable_checkpoint_with_crash(
+        writer: &PostgresChainWriter,
+        height: u64,
+        crash_point: CrashPoint,
+    ) {
+        let anchor = durable_checkpoint_header(writer).await;
+        let mut coordinator = OrderedCommitCoordinator::new(height, height, Some(anchor)).unwrap();
+        let mut committer = CrashBackfillCommitter {
+            writer: writer.clone(),
+            parent_anchor: Some(anchor),
+            crash_point,
+        };
+        coordinator
+            .push_async(live_fetched_height(height), &mut committer)
+            .await
+            .unwrap();
+    }
+
+    async fn durable_checkpoint_header(writer: &PostgresChainWriter) -> BlockHeader {
+        let checkpoint = writer.checkpoint().await.unwrap().unwrap();
+        writer
+            .canonical_header_at_height(checkpoint.last_height)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn live_fetched_height(height: u64) -> FetchedRange<IndexedBlock> {
+        let value = u8::try_from(height).unwrap();
+        let parent = value.saturating_sub(1);
+        FetchedRange::new(
+            BackfillRange::new(height, height).unwrap(),
+            vec![header(value, parent)],
+            vec![block(value, parent)],
+        )
+        .unwrap()
     }
 
     async fn durable_state_snapshot(writer: &PostgresChainWriter) -> DurableStateSnapshot {
