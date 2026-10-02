@@ -32,6 +32,8 @@ pub enum LiveRuntimeError {
     MissingCheckpointHeader(u64),
     #[error("invalid live RPC budget: {0}")]
     Budget(String),
+    #[error("invalid reconnect policy: {0}")]
+    ReconnectPolicy(String),
     #[error(transparent)]
     Pipeline(#[from] LivePipelineError),
 }
@@ -365,7 +367,9 @@ pub enum ReconnectAction {
 pub struct ReconnectPolicy {
     pub base_delay: Duration,
     pub max_delay: Duration,
-    pub jitter: Duration,
+    /// Deterministic per-attempt spread added after the capped exponential delay. This is not
+    /// random jitter; it gives repeatable tests and avoids synchronized reconnects enough for M4.
+    pub deterministic_spread: Duration,
     pub min_healthy_duration: Duration,
 }
 
@@ -378,28 +382,28 @@ impl ReconnectPolicy {
     pub fn new(
         base_delay: Duration,
         max_delay: Duration,
-        jitter: Duration,
+        deterministic_spread: Duration,
         min_healthy_duration: Duration,
     ) -> Result<Self, LiveRuntimeError> {
         if base_delay.is_zero() || max_delay.is_zero() {
-            return Err(LiveRuntimeError::Budget(
+            return Err(LiveRuntimeError::ReconnectPolicy(
                 "reconnect delays must be nonzero".to_owned(),
             ));
         }
         if min_healthy_duration.is_zero() {
-            return Err(LiveRuntimeError::Budget(
+            return Err(LiveRuntimeError::ReconnectPolicy(
                 "reconnect healthy duration must be nonzero".to_owned(),
             ));
         }
         if base_delay > max_delay {
-            return Err(LiveRuntimeError::Budget(
+            return Err(LiveRuntimeError::ReconnectPolicy(
                 "reconnect base delay must not exceed max delay".to_owned(),
             ));
         }
         Ok(Self {
             base_delay,
             max_delay,
-            jitter,
+            deterministic_spread,
             min_healthy_duration,
         })
     }
@@ -409,20 +413,21 @@ impl ReconnectPolicy {
         let exponent = attempt.saturating_sub(1).min(31);
         let multiplier = 1_u64.checked_shl(exponent as u32).unwrap_or(u64::MAX);
         let exponential = saturating_duration_mul(self.base_delay, multiplier).min(self.max_delay);
-        exponential
-            .saturating_add(self.jitter_for_attempt(attempt))
-            .min(self.max_delay)
+        exponential.saturating_add(self.spread_for_attempt(attempt))
     }
 
-    fn jitter_for_attempt(self, attempt: u64) -> Duration {
-        let jitter_nanos = self.jitter.as_nanos().min(u128::from(u64::MAX)) as u64;
-        if jitter_nanos == 0 {
+    fn spread_for_attempt(self, attempt: u64) -> Duration {
+        let spread_nanos = self
+            .deterministic_spread
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        if spread_nanos == 0 {
             return Duration::ZERO;
         }
         let mixed = attempt
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        Duration::from_nanos(mixed % (jitter_nanos + 1))
+        Duration::from_nanos(mixed % (spread_nanos + 1))
     }
 }
 
@@ -833,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_is_unbounded_capped_and_jittered() {
+    fn reconnect_backoff_is_unbounded_capped_and_uses_deterministic_spread() {
         let policy = ReconnectPolicy::new(
             Duration::from_secs(1),
             Duration::from_secs(10),
@@ -853,16 +858,32 @@ mod tests {
         assert!(second > first);
 
         let mut last = second;
+        let mut observed_spread_past_cap = false;
         for _ in 0..128 {
             let ReconnectAction::RetryAfter(delay) = reconnect.record_availability_failure() else {
                 panic!("availability failures keep retrying");
             };
-            assert!(delay <= Duration::from_secs(10));
+            assert!(delay <= Duration::from_millis(10_500));
+            observed_spread_past_cap |= delay > Duration::from_secs(10);
             last = delay;
         }
-        assert_eq!(last, Duration::from_secs(10));
+        assert!(last >= Duration::from_secs(10));
+        assert!(observed_spread_past_cap);
         assert_eq!(reconnect.attempts(), 130);
         assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+    }
+
+    #[test]
+    fn reconnect_policy_validation_has_specific_error_variant() {
+        assert!(matches!(
+            ReconnectPolicy::new(
+                Duration::ZERO,
+                Duration::from_secs(10),
+                Duration::ZERO,
+                Duration::from_secs(30),
+            ),
+            Err(LiveRuntimeError::ReconnectPolicy(_))
+        ));
     }
 
     #[test]
