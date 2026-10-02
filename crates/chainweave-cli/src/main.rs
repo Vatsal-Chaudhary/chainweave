@@ -20,6 +20,8 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+pub mod live_runtime;
+
 #[derive(Debug, Parser)]
 #[command(name = "chainweave", version, about = "Reorg-safe EVM chain indexer")]
 struct Cli {

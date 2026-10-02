@@ -701,6 +701,36 @@ impl PostgresChainWriter {
         .transpose()
     }
 
+    /// Reads a canonical header by block hash from persisted state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error or a conversion error for invalid stored bytes.
+    pub async fn canonical_header_by_hash(
+        &self,
+        hash: BlockHash,
+    ) -> Result<Option<BlockHeader>, PostgresStateError> {
+        sqlx::query(
+            r"
+            SELECT block_hash, parent_hash, height
+            FROM blocks
+            WHERE chain_id = ($1::text)::numeric AND block_hash = $2 AND is_canonical
+            ",
+        )
+        .bind(&self.chain_id)
+        .bind(hash_bytes(&hash))
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            row_to_header(
+                row.try_get("block_hash")?,
+                row.try_get("parent_hash")?,
+                row.try_get("height")?,
+            )
+        })
+        .transpose()
+    }
+
     async fn canonical_headers_descending(
         &self,
         from_height: u64,
