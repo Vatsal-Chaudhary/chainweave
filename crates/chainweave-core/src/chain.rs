@@ -944,6 +944,60 @@ mod tests {
     }
 
     #[test]
+    fn lower_height_head_with_different_hash_reorgs_to_provable_ancestor() {
+        let canonical = headers(&[(0, 0), (1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]);
+        let replacement = header(13, 2, 3);
+        let mut state = ChainState::from_canonical_chain(&canonical, 4, 8).unwrap();
+        let mut resolver = MemoryResolver::default();
+
+        let batch = state.apply(replacement, &mut resolver).unwrap();
+
+        assert_eq!(batch.transition, ChainTransition::Reorg);
+        assert_eq!(batch.common_ancestor, Some(canonical[2]));
+        assert_eq!(
+            event_headers(&batch.events),
+            vec![(false, 5, 5), (false, 4, 4), (false, 3, 3), (true, 13, 3),]
+        );
+        assert_eq!(
+            state.canonical_chain(),
+            vec![canonical[0], canonical[1], canonical[2], replacement]
+        );
+    }
+
+    #[test]
+    fn lower_height_head_with_unprovable_ancestor_fails_closed() {
+        let canonical = headers(&[(0, 0), (1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]);
+        let replacement = header(13, 88, 3);
+        let mut state = ChainState::from_canonical_chain(&canonical, 4, 8).unwrap();
+        let mut resolver = MemoryResolver::default();
+
+        let error = state.apply(replacement, &mut resolver).unwrap_err();
+
+        assert_eq!(error, ChainError::MissingParent { hash: hash(88) });
+        assert_eq!(state.canonical_chain(), canonical);
+    }
+
+    #[test]
+    fn lower_height_head_crossing_finalized_boundary_fails_closed() {
+        let canonical = headers(&[(0, 0), (1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]);
+        let replacement = header(13, 2, 3);
+        let mut state = ChainState::from_canonical_chain(&canonical, 4, 8).unwrap();
+        state.set_finalized_height(Some(3));
+        let mut resolver = MemoryResolver::default();
+
+        let error = state.apply(replacement, &mut resolver).unwrap_err();
+
+        assert_eq!(
+            error,
+            ChainError::FinalizedBoundary {
+                ancestor_height: 2,
+                finalized_height: 3
+            }
+        );
+        assert_eq!(state.canonical_chain(), canonical);
+    }
+
+    #[test]
     fn finalized_boundary_violation_fails_closed() {
         let canonical = headers(&[(0, 0), (1, 0), (2, 1)]);
         let b1 = header(11, 0, 1);

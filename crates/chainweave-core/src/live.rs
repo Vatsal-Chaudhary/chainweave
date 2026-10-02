@@ -113,6 +113,9 @@ pub trait LiveSource {
     fn header_by_number(&mut self, height: u64) -> Result<Option<BlockHeader>, Self::Error>;
     fn header_by_hash(&mut self, hash: BlockHash) -> Result<Option<BlockHeader>, Self::Error>;
     fn block_header(block: &Self::Block) -> BlockHeader;
+    fn block_logs_match_header(_block: &Self::Block) -> bool {
+        true
+    }
 
     fn verify_recent(
         &mut self,
@@ -312,7 +315,8 @@ impl LiveTracker {
             .block_by_number(height)
             .map_err(|error| LiveError::Source(error.to_string()))?;
         budget.record(RpcMethod::GetLogs, report)?;
-        let header = S::block_header(&block);
+        let (header, block) =
+            self.validate_or_refetch_number(source, height, block, budget, report)?;
         let fetched = FetchedRange::new(
             BackfillRange::new(height, height)?,
             vec![header],
@@ -375,6 +379,8 @@ impl LiveTracker {
                         .block_by_hash(header.hash)
                         .map_err(|error| LiveError::Source(error.to_string()))?;
                     budget.record(RpcMethod::GetLogs, report)?;
+                    let block =
+                        self.validate_or_refetch_hash(source, *header, block, budget, report)?;
                     apply_blocks.push(block);
                 }
             }
@@ -383,6 +389,67 @@ impl LiveTracker {
         sink.commit_batch(batch, apply_blocks)
             .map_err(|error| LiveError::Sink(error.to_string()))?;
         Ok(())
+    }
+
+    fn validate_or_refetch_number<S>(
+        &self,
+        source: &mut S,
+        height: u64,
+        block: S::Block,
+        budget: &mut WindowBudget,
+        report: &mut LiveReport,
+    ) -> Result<(BlockHeader, S::Block), LiveError>
+    where
+        S: LiveSource,
+    {
+        let header = S::block_header(&block);
+        if S::block_logs_match_header(&block) {
+            return Ok((header, block));
+        }
+
+        report.transition(LiveReadiness::Degraded);
+        budget.record(RpcMethod::GetBlockByNumber, report)?;
+        let block = source
+            .block_by_number(height)
+            .map_err(|error| LiveError::Source(error.to_string()))?;
+        budget.record(RpcMethod::GetLogs, report)?;
+        let header = S::block_header(&block);
+        if !S::block_logs_match_header(&block) {
+            return Err(LiveError::Source(format!(
+                "block/log hash mismatch persisted at height {height}"
+            )));
+        }
+        Ok((header, block))
+    }
+
+    fn validate_or_refetch_hash<S>(
+        &self,
+        source: &mut S,
+        expected: BlockHeader,
+        block: S::Block,
+        budget: &mut WindowBudget,
+        report: &mut LiveReport,
+    ) -> Result<S::Block, LiveError>
+    where
+        S: LiveSource,
+    {
+        if S::block_header(&block) == expected && S::block_logs_match_header(&block) {
+            return Ok(block);
+        }
+
+        report.transition(LiveReadiness::Degraded);
+        budget.record(RpcMethod::GetBlockByHash, report)?;
+        let block = source
+            .block_by_hash(expected.hash)
+            .map_err(|error| LiveError::Source(error.to_string()))?;
+        budget.record(RpcMethod::GetLogs, report)?;
+        if S::block_header(&block) != expected || !S::block_logs_match_header(&block) {
+            return Err(LiveError::Source(format!(
+                "block/log hash mismatch persisted at height {}",
+                expected.height
+            )));
+        }
+        Ok(block)
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::time::Duration;
 
@@ -355,7 +355,10 @@ fn block_hash_log_mismatch_restarts_reconciliation_without_commit() {
         scenario,
         LiveOutcome::ready_at(block(&chain, 71).header)
             .with_apply_order([71])
-            .with_log_block_hash_filters([block(&chain, 71).header.hash]),
+            .with_log_block_hash_filters([
+                block(&chain, 71).header.hash,
+                block(&chain, 71).header.hash,
+            ]),
     );
 }
 
@@ -725,6 +728,7 @@ struct FakeLiveSource {
     faults: Vec<LiveFault>,
     header_by_hash_calls: Vec<BlockHash>,
     log_block_hash_filters: Vec<BlockHash>,
+    mismatched_log_once: BTreeSet<u64>,
 }
 
 impl FakeLiveSource {
@@ -746,6 +750,7 @@ impl FakeLiveSource {
             faults: scenario.faults.clone(),
             header_by_hash_calls: Vec::new(),
             log_block_hash_filters: Vec::new(),
+            mismatched_log_once: BTreeSet::new(),
         }
     }
 
@@ -792,6 +797,17 @@ impl FakeLiveSource {
         })
     }
 
+    fn maybe_mismatched_logs(&mut self, mut block: FakeBlock) -> FakeBlock {
+        if self.records_log_filter(block.header.height)
+            && self.mismatched_log_once.insert(block.header.height)
+        {
+            for log in &mut block.logs {
+                log.block_hash = hash(250);
+            }
+        }
+        block
+    }
+
     fn records_header_by_hash(&self, hash: BlockHash) -> bool {
         self.faults.iter().any(|fault| {
             matches!(fault, LiveFault::UnknownParentRequiresHash(expected) if *expected == hash)
@@ -821,7 +837,7 @@ impl LiveSource for FakeLiveSource {
         if self.records_log_filter(height) {
             self.log_block_hash_filters.push(block.header.hash);
         }
-        Ok(block)
+        Ok(self.maybe_mismatched_logs(block))
     }
 
     fn block_by_hash(&mut self, hash: BlockHash) -> Result<Self::Block, Self::Error> {
@@ -832,7 +848,7 @@ impl LiveSource for FakeLiveSource {
         if self.records_log_filter(block.header.height) {
             self.log_block_hash_filters.push(block.header.hash);
         }
-        Ok(block)
+        Ok(self.maybe_mismatched_logs(block))
     }
 
     fn header_by_number(&mut self, height: u64) -> Result<Option<BlockHeader>, Self::Error> {
@@ -848,6 +864,13 @@ impl LiveSource for FakeLiveSource {
 
     fn block_header(block: &Self::Block) -> BlockHeader {
         block.header
+    }
+
+    fn block_logs_match_header(block: &Self::Block) -> bool {
+        block
+            .logs
+            .iter()
+            .all(|log| log.block_hash == block.header.hash)
     }
 
     fn verify_recent(
@@ -907,6 +930,9 @@ impl RangeCommitSink<FakeBlock> for FakeLiveSink {
             .next()
             .ok_or_else(|| "missing live block payload".to_owned())?;
         let header = block.header;
+        if !block.logs.iter().all(|log| log.block_hash == header.hash) {
+            return Err(format!("log hash mismatch at {}", header.height));
+        }
         self.canonical.insert(header.height, block);
         self.checkpoint = Some(header);
         if header.height == 61 {
@@ -956,6 +982,9 @@ impl LiveSink<FakeBlock> for FakeLiveSink {
                         .ok_or_else(|| format!("missing apply payload for {}", header.height))?;
                     if block.header != header {
                         return Err(format!("apply payload hash mismatch at {}", header.height));
+                    }
+                    if !block.logs.iter().all(|log| log.block_hash == header.hash) {
+                        return Err(format!("log hash mismatch at {}", header.height));
                     }
                     self.canonical.insert(header.height, block);
                     self.checkpoint = Some(header);
