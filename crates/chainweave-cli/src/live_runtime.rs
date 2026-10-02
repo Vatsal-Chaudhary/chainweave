@@ -5,8 +5,8 @@ use std::{
 };
 
 use chainweave_core::{
-    BackfillRange, BlockHash, BlockHeader, FetchedRange, OrderedCommitCoordinator, RetryPolicy,
-    RpcBudget, RpcMethod,
+    BackfillRange, BlockHash, BlockHeader, ChainError, FetchedRange, OrderedCommitCoordinator,
+    RetryPolicy, RpcBudget, RpcMethod,
 };
 use chainweave_rpc::{
     ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
@@ -483,6 +483,14 @@ impl ReconnectLoop {
         self.halted = true;
         ReconnectAction::Halt
     }
+
+    #[must_use]
+    pub fn record_pipeline_error(&mut self, error: &LivePipelineError) -> ReconnectAction {
+        match error.classify() {
+            LivePipelineErrorClass::Transient => self.record_availability_failure(),
+            LivePipelineErrorClass::Correctness => self.record_correctness_error(),
+        }
+    }
 }
 
 fn saturating_duration_mul(duration: Duration, multiplier: u64) -> Duration {
@@ -503,6 +511,14 @@ pub enum LivePipelineStage {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LivePipelineError {
+    #[error("live pipeline correctness error: {0}")]
+    Chain(#[from] ChainError),
+    #[error("live pipeline transient RPC error: {0}")]
+    RpcTransient(String),
+    #[error("live pipeline transient WebSocket error: {0}")]
+    WebSocketTransient(String),
+    #[error("live pipeline transient database error: {0}")]
+    DatabaseTransient(String),
     #[error("live pipeline channel for {0:?} closed")]
     ChannelClosed(LivePipelineStage),
     #[error("live pipeline send from {stage:?} timed out after {timeout:?}")]
@@ -522,6 +538,32 @@ pub enum LivePipelineError {
     SupervisorCancelled,
     #[error("live pipeline queue capacity must be nonzero")]
     InvalidQueueCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePipelineErrorClass {
+    Transient,
+    Correctness,
+}
+
+impl LivePipelineError {
+    #[must_use]
+    pub const fn classify(&self) -> LivePipelineErrorClass {
+        match self {
+            Self::RpcTransient(_)
+            | Self::WebSocketTransient(_)
+            | Self::DatabaseTransient(_)
+            | Self::SendTimedOut { .. } => LivePipelineErrorClass::Transient,
+            Self::Chain(_)
+            | Self::ChannelClosed(_)
+            | Self::Shutdown(_)
+            | Self::StagePanicked(_)
+            | Self::StageCancelled(_)
+            | Self::StageExitedEarly(_)
+            | Self::SupervisorCancelled
+            | Self::InvalidQueueCapacity => LivePipelineErrorClass::Correctness,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +885,26 @@ mod tests {
             reconnect.record_availability_failure(),
             ReconnectAction::Halt
         );
+    }
+
+    #[test]
+    fn max_depth_pipeline_error_halts_reconnect_without_retry() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+        let error = LivePipelineError::Chain(ChainError::MaxDepthExceeded { max_depth: 3 });
+
+        assert_eq!(error.classify(), LivePipelineErrorClass::Correctness);
+        assert_eq!(
+            reconnect.record_pipeline_error(&error),
+            ReconnectAction::Halt
+        );
+        assert!(reconnect.is_halted());
+        assert_eq!(reconnect.attempts(), 0);
     }
 
     #[test]
