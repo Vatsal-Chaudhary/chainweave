@@ -521,11 +521,6 @@ pub enum LivePipelineError {
     DatabaseTransient(String),
     #[error("live pipeline channel for {0:?} closed")]
     ChannelClosed(LivePipelineStage),
-    #[error("live pipeline send from {stage:?} timed out after {timeout:?}")]
-    SendTimedOut {
-        stage: LivePipelineStage,
-        timeout: Duration,
-    },
     #[error("live pipeline shutdown while {0:?} was waiting")]
     Shutdown(LivePipelineStage),
     #[error("live pipeline stage {0:?} panicked")]
@@ -550,10 +545,9 @@ impl LivePipelineError {
     #[must_use]
     pub const fn classify(&self) -> LivePipelineErrorClass {
         match self {
-            Self::RpcTransient(_)
-            | Self::WebSocketTransient(_)
-            | Self::DatabaseTransient(_)
-            | Self::SendTimedOut { .. } => LivePipelineErrorClass::Transient,
+            Self::RpcTransient(_) | Self::WebSocketTransient(_) | Self::DatabaseTransient(_) => {
+                LivePipelineErrorClass::Transient
+            }
             Self::Chain(_)
             | Self::ChannelClosed(_)
             | Self::Shutdown(_)
@@ -572,7 +566,6 @@ pub struct LivePipelineConfig {
     pub coordinate_queue: usize,
     pub raw_queue: usize,
     pub write_queue: usize,
-    pub send_timeout: Duration,
 }
 
 impl LivePipelineConfig {
@@ -582,14 +575,12 @@ impl LivePipelineConfig {
         coordinate_queue: usize,
         raw_queue: usize,
         write_queue: usize,
-        send_timeout: Duration,
     ) -> Self {
         Self {
             fetch_queue,
             coordinate_queue,
             raw_queue,
             write_queue,
-            send_timeout,
         }
     }
 }
@@ -639,17 +630,16 @@ pub fn bounded_live_pipeline_queues<Fetch, Coordinate, Raw, Write>(
     })
 }
 
-/// Sends one item to the next bounded stage, returning on shutdown or timeout instead of waiting
-/// forever behind a full queue.
+/// Sends one item to the next bounded stage, waiting behind normal backpressure until the next
+/// stage has capacity or shutdown is requested.
 ///
 /// # Errors
 ///
-/// Returns a pipeline error when the queue closes, the send times out, or shutdown is requested.
+/// Returns a pipeline error when the queue closes or shutdown is requested.
 pub async fn send_with_shutdown<T>(
     stage: LivePipelineStage,
     sender: &mpsc::Sender<T>,
     item: T,
-    timeout: Duration,
     shutdown: &CancellationToken,
 ) -> Result<(), LivePipelineError>
 where
@@ -657,11 +647,7 @@ where
 {
     tokio::select! {
         () = shutdown.cancelled() => Err(LivePipelineError::Shutdown(stage)),
-        result = tokio::time::timeout(timeout, sender.send(item)) => match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(LivePipelineError::ChannelClosed(stage)),
-            Err(_) => Err(LivePipelineError::SendTimedOut { stage, timeout }),
-        },
+        result = sender.send(item) => result.map_err(|_| LivePipelineError::ChannelClosed(stage)),
     }
 }
 
@@ -673,7 +659,6 @@ where
 pub async fn raw_pass_through_stage<T>(
     mut receiver: mpsc::Receiver<T>,
     sender: mpsc::Sender<T>,
-    send_timeout: Duration,
     shutdown: CancellationToken,
 ) -> Result<(), LivePipelineError>
 where
@@ -690,7 +675,6 @@ where
                     LivePipelineStage::RawPassThrough,
                     &sender,
                     item,
-                    send_timeout,
                     &shutdown,
                 )
                 .await?;
@@ -910,10 +894,8 @@ mod tests {
 
     #[test]
     fn bounded_pipeline_queues_use_configured_capacities() {
-        let queues: LivePipelineQueues<u64, u64, u64, u64> = bounded_live_pipeline_queues(
-            LivePipelineConfig::new(1, 2, 3, 4, Duration::from_millis(10)),
-        )
-        .unwrap();
+        let queues: LivePipelineQueues<u64, u64, u64, u64> =
+            bounded_live_pipeline_queues(LivePipelineConfig::new(1, 2, 3, 4)).unwrap();
 
         assert_eq!(queues.fetch_tx.max_capacity(), 1);
         assert_eq!(queues.coordinate_tx.max_capacity(), 2);
@@ -923,13 +905,8 @@ mod tests {
 
     #[test]
     fn bounded_pipeline_rejects_zero_capacity() {
-        let result = bounded_live_pipeline_queues::<u64, u64, u64, u64>(LivePipelineConfig::new(
-            1,
-            0,
-            1,
-            1,
-            Duration::from_millis(10),
-        ));
+        let result =
+            bounded_live_pipeline_queues::<u64, u64, u64, u64>(LivePipelineConfig::new(1, 0, 1, 1));
 
         assert!(matches!(
             result,
@@ -938,28 +915,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_queue_send_times_out_with_stage_name() {
+    async fn full_queue_send_waits_for_capacity_without_failing() {
         let (sender, mut receiver) = mpsc::channel(1);
         sender.send(10_u64).await.unwrap();
         let shutdown = CancellationToken::new();
+        let send_shutdown = shutdown.clone();
 
-        let result = send_with_shutdown(
-            LivePipelineStage::Fetch,
-            &sender,
-            11_u64,
-            Duration::from_millis(1),
-            &shutdown,
-        )
-        .await;
+        let blocked_send = tokio::spawn(async move {
+            send_with_shutdown(LivePipelineStage::Fetch, &sender, 11_u64, &send_shutdown).await
+        });
 
-        assert_eq!(
-            result,
-            Err(LivePipelineError::SendTimedOut {
-                stage: LivePipelineStage::Fetch,
-                timeout: Duration::from_millis(1)
-            })
-        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!blocked_send.is_finished());
         assert_eq!(receiver.recv().await, Some(10));
+        assert_eq!(blocked_send.await.unwrap(), Ok(()));
+        assert_eq!(receiver.recv().await, Some(11));
     }
 
     #[tokio::test]
@@ -971,13 +941,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            send_with_shutdown(
-                LivePipelineStage::Coordinate,
-                &sender,
-                11_u64,
-                Duration::from_secs(60),
-                &shutdown,
-            ),
+            send_with_shutdown(LivePipelineStage::Coordinate, &sender, 11_u64, &shutdown),
         )
         .await
         .unwrap();
@@ -998,7 +962,7 @@ mod tests {
         raw_tx.send(32_u64).await.unwrap();
         drop(raw_tx);
 
-        raw_pass_through_stage(raw_rx, write_tx, Duration::from_millis(50), shutdown)
+        raw_pass_through_stage(raw_rx, write_tx, shutdown)
             .await
             .unwrap();
 
