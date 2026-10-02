@@ -96,3 +96,23 @@ pub async fn fetch_header_by_number_with_retry(
     )
     .await
 }
+
+/// Fetches one header by hash through the shared retry policy.
+///
+/// # Errors
+///
+/// Returns an RPC error when all retry attempts fail or time out.
+pub async fn fetch_header_by_hash_with_retry(
+    client: &RpcClient,
+    hash: [u8; 32],
+    retry_policy: RetryPolicy,
+    rpc_timeout: Duration,
+) -> Result<Option<BlockHeader>, RpcError> {
+    retry_rpc_request(
+        retry_policy,
+        rpc_timeout,
+        || RpcError::Request(format!("timed out fetching header by hash {hash:?}")),
+        || client.fetch_header_by_hash(hash),
+    )
+    .await
+}

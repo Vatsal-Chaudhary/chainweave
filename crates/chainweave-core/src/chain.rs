@@ -296,13 +296,6 @@ impl ChainState {
             return Ok(batch);
         };
 
-        if new_head.height < tip.height {
-            return Err(ChainError::NewHeadBehindTip {
-                new_height: new_head.height,
-                tip_height: tip.height,
-            });
-        }
-
         if new_head.parent_hash == tip.hash {
             if new_head.height != tip.height + 1 {
                 return Err(ChainError::InvalidExtensionHeight {

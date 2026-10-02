@@ -1,6 +1,7 @@
 pub mod backfill;
 pub mod chain;
 pub mod config;
+pub mod live;
 
 pub use backfill::{
     AsyncRangeCommitSink, BackfillError, BackfillHandoff, BackfillPlan, BackfillRange,
@@ -12,3 +13,7 @@ pub use chain::{
     ChainTransition, ResolverError,
 };
 pub use config::{AppConfig, ChainIdentity, ConfigError, ValidationProfile};
+pub use live::{
+    LiveConfig, LiveError, LiveHaltReason, LiveHeadEvent, LiveReadiness, LiveReport, LiveSink,
+    LiveSource, LiveTracker, VerifierStatus,
+};

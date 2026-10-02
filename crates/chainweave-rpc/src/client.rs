@@ -212,6 +212,22 @@ impl RpcClient {
         block_header(&block)
     }
 
+    /// Fetches a block header by hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the RPC request fails or the block/header response is incomplete.
+    pub async fn fetch_header_by_hash(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<BlockHeader>, RpcError> {
+        self.fetch_rpc_block_by_hash(hash)
+            .await?
+            .as_ref()
+            .map(block_header)
+            .transpose()
+    }
+
     /// Fetches a block by canonical block number and converts it to durable sink input.
     ///
     /// The returned block has no logs attached; range backfill attaches logs from
@@ -223,6 +239,27 @@ impl RpcClient {
     pub async fn fetch_block_by_number(&self, height: u64) -> Result<IndexedBlock, RpcError> {
         let block = self.fetch_rpc_block_by_number(height).await?;
         indexed_block_from_rpc(block, Vec::new())
+    }
+
+    /// Fetches a block by hash and attaches logs fetched with an `eth_getLogs` `blockHash` filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the RPC request fails, the block is unavailable, or any returned log
+    /// is anchored to a different block hash.
+    pub async fn fetch_block_by_hash(&self, hash: [u8; 32]) -> Result<IndexedBlock, RpcError> {
+        let block = self
+            .fetch_rpc_block_by_hash(hash)
+            .await?
+            .ok_or(RpcError::MissingBlock("hash"))?;
+        let header = block_header(&block)?;
+        let logs = self.fetch_logs_by_block_hash(hash, None).await?;
+        if header.hash != hash {
+            return Err(RpcError::LogBlockHashMismatch {
+                height: header.height,
+            });
+        }
+        indexed_block_from_rpc(block, logs)
     }
 
     /// Fetches canonical blocks for an inclusive block range in one JSON-RPC batch.
@@ -270,6 +307,24 @@ impl RpcClient {
             .await?
             .into_iter()
             .map(|log| anchored_raw_log_from_rpc(log, range))
+            .collect()
+    }
+
+    /// Fetches logs for exactly one block hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `eth_getLogs` fails or any returned log is anchored to a different
+    /// block hash.
+    pub async fn fetch_logs_by_block_hash(
+        &self,
+        block_hash: [u8; 32],
+        filter: Option<ContractLogFilter>,
+    ) -> Result<Vec<RawLog>, RpcError> {
+        self.fetch_rpc_logs_by_block_hash(block_hash, filter)
+            .await?
+            .into_iter()
+            .map(|log| raw_log_from_rpc_block_hash(log, block_hash))
             .collect()
     }
 
@@ -391,6 +446,16 @@ impl RpcClient {
             .ok_or(RpcError::MissingBlockNumber(height))
     }
 
+    async fn fetch_rpc_block_by_hash(&self, hash: [u8; 32]) -> Result<Option<RpcBlock>, RpcError> {
+        self.provider
+            .raw_request::<_, Option<RpcBlock>>(
+                "eth_getBlockByHash".into(),
+                (B256::from(hash), false),
+            )
+            .await
+            .map_err(request_error)
+    }
+
     async fn fetch_rpc_blocks_by_number(
         &self,
         range: BackfillRange,
@@ -434,6 +499,23 @@ impl RpcClient {
             .await
             .map_err(request_error)
     }
+
+    async fn fetch_rpc_logs_by_block_hash(
+        &self,
+        block_hash: [u8; 32],
+        contract_filter: Option<ContractLogFilter>,
+    ) -> Result<Vec<RpcLog>, RpcError> {
+        let mut filter = json!({
+            "blockHash": B256::from(block_hash).to_string(),
+        });
+        if let Some(contract_filter) = contract_filter {
+            filter["address"] = json!(contract_filter.address.to_string());
+        }
+        self.provider
+            .raw_request::<_, Vec<RpcLog>>("eth_getLogs".into(), (filter,))
+            .await
+            .map_err(request_error)
+    }
 }
 
 fn indexed_block_from_rpc(block: RpcBlock, logs: Vec<RawLog>) -> Result<IndexedBlock, RpcError> {
@@ -463,6 +545,46 @@ fn block_header(block: &RpcBlock) -> Result<BlockHeader, RpcError> {
 
 fn raw_log_from_rpc(log: RpcLog, range: BackfillRange) -> Result<RawLog, RpcError> {
     anchored_raw_log_from_rpc(log, range).map(|log| log.raw)
+}
+
+fn raw_log_from_rpc_block_hash(
+    log: RpcLog,
+    expected_block_hash: [u8; 32],
+) -> Result<RawLog, RpcError> {
+    if log.removed {
+        return Err(RpcError::Request(
+            "eth_getLogs returned a removed log for a hash-anchored block".to_owned(),
+        ));
+    }
+    let block_hash = log
+        .block_hash
+        .map(fixed_32)
+        .ok_or(RpcError::MissingLogField("block_hash"))?;
+    if block_hash != expected_block_hash {
+        return Err(RpcError::LogBlockHashMismatch {
+            height: log.block_number.unwrap_or_default(),
+        });
+    }
+    let transaction_index = required_u32(log.transaction_index, "transaction_index")?;
+    let log_index = required_u32(log.log_index, "log_index")?;
+    let tx_hash = log
+        .transaction_hash
+        .map(fixed_32)
+        .ok_or(RpcError::MissingLogField("transaction_hash"))?;
+    let address = fixed_20(log.address);
+    let topics = log.topics.into_iter().map(fixed_32).collect();
+    let data = log.data.as_ref().to_vec();
+
+    Ok(RawLog {
+        transaction_index,
+        log_index,
+        tx_hash,
+        address,
+        topics,
+        data,
+        decoded_event: None,
+        decoder_version: None,
+    })
 }
 
 fn anchored_raw_log_from_rpc(
@@ -673,6 +795,14 @@ mod tests {
         assert_eq!(header.hash, hash(0xcc));
         assert_eq!(header.parent_hash, hash(0xaa));
 
+        let header_by_hash = client
+            .fetch_header_by_hash(HEAD_HASH.parse::<B256>().unwrap().0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header_by_hash.height, 2);
+        assert_eq!(header_by_hash.hash, hash(0xbb));
+
         let logs = client.fetch_logs(range).await.unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].transaction_index, 0);
@@ -681,6 +811,21 @@ mod tests {
         assert_eq!(logs[0].address, [0x22; 20]);
         assert_eq!(logs[0].topics, vec![hash(0x33)]);
         assert_eq!(logs[0].data, vec![0x44, 0x55]);
+
+        let hash_logs = client
+            .fetch_logs_by_block_hash(HEAD_HASH.parse::<B256>().unwrap().0, None)
+            .await
+            .unwrap();
+        assert_eq!(hash_logs.len(), 1);
+        assert_eq!(hash_logs[0].log_index, 1);
+        assert_eq!(hash_logs[0].tx_hash, hash(0x12));
+
+        let hash_block = client
+            .fetch_block_by_hash(HEAD_HASH.parse::<B256>().unwrap().0)
+            .await
+            .unwrap();
+        assert_eq!(hash_block.header.height, 2);
+        assert_eq!(hash_block.logs.len(), 1);
 
         let fetched = client.fetch_backfill_range(range).await.unwrap();
         assert_eq!(fetched.headers.len(), 2);
@@ -716,25 +861,39 @@ mod tests {
                 let height = request["params"][0].as_str().unwrap();
                 block_response(height)
             }
+            "eth_getBlockByHash" => {
+                let hash = request["params"][0].as_str().unwrap();
+                match hash {
+                    HEAD_HASH => block_response("0x2"),
+                    _ => Value::Null,
+                }
+            }
             "eth_getLogs" => {
                 let filter = &request["params"][0];
-                assert_eq!(filter["fromBlock"], "0x1");
-                assert_eq!(filter["toBlock"], "0x2");
-                json!([
-                    log_response(
-                        "0x1",
-                        "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                        "0x0",
-                        "0x0",
-                        "0x11",
-                        "0x22",
-                        "0x33",
-                        "0x4455"
-                    ),
-                    log_response(
+                if filter.get("blockHash").is_some() {
+                    assert_eq!(filter["blockHash"], HEAD_HASH);
+                    json!([log_response(
                         "0x2", HEAD_HASH, "0x0", "0x1", "0x12", "0x23", "0x34", "0x66"
-                    )
-                ])
+                    )])
+                } else {
+                    assert_eq!(filter["fromBlock"], "0x1");
+                    assert_eq!(filter["toBlock"], "0x2");
+                    json!([
+                        log_response(
+                            "0x1",
+                            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                            "0x0",
+                            "0x0",
+                            "0x11",
+                            "0x22",
+                            "0x33",
+                            "0x4455"
+                        ),
+                        log_response(
+                            "0x2", HEAD_HASH, "0x0", "0x1", "0x12", "0x23", "0x34", "0x66"
+                        )
+                    ])
+                }
             }
             _ => panic!("unexpected fixture RPC method: {method}"),
         };

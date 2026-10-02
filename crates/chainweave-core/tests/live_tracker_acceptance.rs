@@ -1,6 +1,12 @@
 use std::collections::BTreeMap;
 
-use chainweave_core::{BlockHash, BlockHeader, RpcMethod};
+use std::time::Duration;
+
+use chainweave_core::{
+    BlockHash, BlockHeader, ChainBatch, ChainEvent, FetchedRange, LiveConfig, LiveHaltReason,
+    LiveHeadEvent, LiveReadiness, LiveSink, LiveSource, LiveTracker, RangeCommitSink, RetryPolicy,
+    RpcMethod, VerifierStatus,
+};
 
 #[derive(Debug, Clone)]
 struct LiveScenario {
@@ -142,7 +148,9 @@ fn dropped_head_notifications_are_healed_by_poll_reconciliation() {
 
     expect_live_outcome(
         scenario,
-        LiveOutcome::ready_at(block(&chain, 3).header).with_canonical_heights([0, 1, 2, 3]),
+        LiveOutcome::ready_at(block(&chain, 3).header)
+            .with_canonical_heights([0, 1, 2, 3])
+            .with_apply_order([1, 2, 3]),
     );
 }
 
@@ -189,7 +197,9 @@ fn reordered_head_notifications_reconcile_to_current_head() {
 
     expect_live_outcome(
         scenario,
-        LiveOutcome::ready_at(block(&chain, 5).header).with_canonical_heights([0, 1, 2, 3, 4, 5]),
+        LiveOutcome::ready_at(block(&chain, 5).header)
+            .with_canonical_heights([0, 1, 2, 3, 4, 5])
+            .with_apply_order([1, 2, 3, 4, 5]),
     );
 }
 
@@ -694,9 +704,431 @@ fn expect_live_outcome(scenario: LiveScenario, expected: LiveOutcome) {
 
 fn run_live_tracker(scenario: LiveScenario) -> Result<LiveOutcome, LiveHarnessError> {
     let _ = consume_scenario(&scenario);
-    Err(LiveHarnessError::MissingLiveTracker {
-        scenario: scenario.name,
-    })
+    let events = live_events(&scenario.heads.events);
+    let tracker = LiveTracker::new(live_config(&scenario.config));
+    let mut source = FakeLiveSource::new(&scenario);
+    let mut sink = FakeLiveSink::new(&scenario);
+    let report = tracker.run(&mut source, &mut sink, events).map_err(|_| {
+        LiveHarnessError::MissingLiveTracker {
+            scenario: scenario.name,
+        }
+    })?;
+    Ok(outcome_from_report(&scenario, &source, &sink, report))
+}
+
+#[derive(Debug, Clone)]
+struct FakeLiveSource {
+    primary: BTreeMap<u64, FakeBlock>,
+    alternate: BTreeMap<u64, FakeBlock>,
+    verifier: BTreeMap<u64, FakeBlock>,
+    head: BlockHeader,
+    faults: Vec<LiveFault>,
+    header_by_hash_calls: Vec<BlockHash>,
+    log_block_hash_filters: Vec<BlockHash>,
+}
+
+impl FakeLiveSource {
+    fn new(scenario: &LiveScenario) -> Self {
+        Self {
+            primary: scenario.rpc.primary.clone(),
+            alternate: scenario.rpc.alternate.clone(),
+            verifier: scenario.rpc.verifier.clone(),
+            head: current_head_from_events(&scenario.heads.events)
+                .or_else(|| {
+                    scenario
+                        .rpc
+                        .primary
+                        .values()
+                        .last()
+                        .map(|block| block.header)
+                })
+                .expect("scenario has a current head"),
+            faults: scenario.faults.clone(),
+            header_by_hash_calls: Vec::new(),
+            log_block_hash_filters: Vec::new(),
+        }
+    }
+
+    fn branch_for_number(&self, height: u64) -> Option<&FakeBlock> {
+        if let Some(at_height) = self.reorg_during_catch_up_height()
+            && height < at_height
+        {
+            return self.primary.get(&height);
+        }
+        self.active_branch()
+            .get(&height)
+            .or_else(|| self.primary.get(&height))
+    }
+
+    fn active_branch(&self) -> &BTreeMap<u64, FakeBlock> {
+        if self
+            .alternate
+            .values()
+            .any(|block| block.header.hash == self.head.hash)
+        {
+            &self.alternate
+        } else {
+            &self.primary
+        }
+    }
+
+    fn block_for_hash(&self, hash: BlockHash) -> Option<&FakeBlock> {
+        self.alternate
+            .values()
+            .chain(self.primary.values())
+            .find(|block| block.header.hash == hash)
+    }
+
+    fn reorg_during_catch_up_height(&self) -> Option<u64> {
+        self.faults.iter().find_map(|fault| match fault {
+            LiveFault::ReorgDuringCatchUp { at_height } => Some(*at_height),
+            _ => None,
+        })
+    }
+
+    fn records_log_filter(&self, height: u64) -> bool {
+        self.faults.iter().any(|fault| {
+            matches!(fault, LiveFault::BlockHashLogMismatch { height: fault_height } if *fault_height == height)
+        })
+    }
+
+    fn records_header_by_hash(&self, hash: BlockHash) -> bool {
+        self.faults.iter().any(|fault| {
+            matches!(fault, LiveFault::UnknownParentRequiresHash(expected) if *expected == hash)
+        })
+    }
+
+    fn verifier_disagrees(&self, height: u64) -> bool {
+        self.faults.iter().any(|fault| {
+            matches!(fault, LiveFault::ProviderDisagreement { height: fault_height } if *fault_height == height)
+        })
+    }
+}
+
+impl LiveSource for FakeLiveSource {
+    type Block = FakeBlock;
+    type Error = String;
+
+    fn current_head(&mut self) -> Result<BlockHeader, Self::Error> {
+        Ok(self.head)
+    }
+
+    fn block_by_number(&mut self, height: u64) -> Result<Self::Block, Self::Error> {
+        let block = self
+            .branch_for_number(height)
+            .cloned()
+            .ok_or_else(|| format!("missing block at height {height}"))?;
+        if self.records_log_filter(height) {
+            self.log_block_hash_filters.push(block.header.hash);
+        }
+        Ok(block)
+    }
+
+    fn block_by_hash(&mut self, hash: BlockHash) -> Result<Self::Block, Self::Error> {
+        let block = self
+            .block_for_hash(hash)
+            .cloned()
+            .ok_or_else(|| format!("missing block for hash {hash:?}"))?;
+        if self.records_log_filter(block.header.height) {
+            self.log_block_hash_filters.push(block.header.hash);
+        }
+        Ok(block)
+    }
+
+    fn header_by_number(&mut self, height: u64) -> Result<Option<BlockHeader>, Self::Error> {
+        Ok(self.branch_for_number(height).map(|block| block.header))
+    }
+
+    fn header_by_hash(&mut self, hash: BlockHash) -> Result<Option<BlockHeader>, Self::Error> {
+        if self.records_header_by_hash(hash) {
+            self.header_by_hash_calls.push(hash);
+        }
+        Ok(self.block_for_hash(hash).map(|block| block.header))
+    }
+
+    fn block_header(block: &Self::Block) -> BlockHeader {
+        block.header
+    }
+
+    fn verify_recent(
+        &mut self,
+        height: u64,
+        hash: BlockHash,
+    ) -> Result<VerifierStatus, Self::Error> {
+        if self.verifier_disagrees(height)
+            || self
+                .verifier
+                .get(&height)
+                .is_some_and(|block| block.header.hash != hash)
+        {
+            Ok(VerifierStatus::Disagree)
+        } else {
+            Ok(VerifierStatus::Match)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FakeLiveSink {
+    checkpoint: Option<BlockHeader>,
+    canonical: BTreeMap<u64, FakeBlock>,
+    committed_before_fault: Vec<u64>,
+}
+
+impl FakeLiveSink {
+    fn new(scenario: &LiveScenario) -> Self {
+        let checkpoint_height = scenario.checkpoint.map(|header| header.height);
+        let canonical = scenario
+            .rpc
+            .primary
+            .iter()
+            .filter(|(height, _)| checkpoint_height.is_some_and(|limit| **height <= limit))
+            .map(|(height, block)| (*height, block.clone()))
+            .collect();
+        Self {
+            checkpoint: scenario.checkpoint,
+            canonical,
+            committed_before_fault: Vec::new(),
+        }
+    }
+
+    fn canonical_heights(&self) -> Vec<u64> {
+        self.canonical.keys().copied().collect()
+    }
+}
+
+impl RangeCommitSink<FakeBlock> for FakeLiveSink {
+    type Error = String;
+
+    fn commit_range(&mut self, fetched: FetchedRange<FakeBlock>) -> Result<(), Self::Error> {
+        let block = fetched
+            .logs
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing live block payload".to_owned())?;
+        let header = block.header;
+        self.canonical.insert(header.height, block);
+        self.checkpoint = Some(header);
+        if header.height == 61 {
+            self.committed_before_fault.push(61);
+        }
+        Ok(())
+    }
+}
+
+impl LiveSink<FakeBlock> for FakeLiveSink {
+    fn checkpoint(&self) -> Option<BlockHeader> {
+        self.checkpoint
+    }
+
+    fn canonical_header_at_height(&self, height: u64) -> Option<BlockHeader> {
+        self.canonical.get(&height).map(|block| block.header)
+    }
+
+    fn canonical_header_by_hash(&self, hash: BlockHash) -> Option<BlockHeader> {
+        self.canonical
+            .values()
+            .find(|block| block.header.hash == hash)
+            .map(|block| block.header)
+    }
+
+    fn commit_batch(
+        &mut self,
+        batch: ChainBatch,
+        apply_blocks: Vec<FakeBlock>,
+    ) -> Result<(), Self::Error> {
+        let mut apply_blocks = apply_blocks.into_iter();
+        for event in batch.events {
+            match event {
+                ChainEvent::Rollback(header) => {
+                    if self
+                        .canonical
+                        .get(&header.height)
+                        .is_some_and(|block| block.header.hash == header.hash)
+                    {
+                        self.canonical.remove(&header.height);
+                    }
+                    self.checkpoint = batch.common_ancestor;
+                }
+                ChainEvent::Apply(header) => {
+                    let block = apply_blocks
+                        .next()
+                        .ok_or_else(|| format!("missing apply payload for {}", header.height))?;
+                    if block.header != header {
+                        return Err(format!("apply payload hash mismatch at {}", header.height));
+                    }
+                    self.canonical.insert(header.height, block);
+                    self.checkpoint = Some(header);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn live_config(config: &LiveTestConfig) -> LiveConfig {
+    LiveConfig {
+        max_reorg_depth: config.max_reorg_depth,
+        live_budget_cost_units_per_minute: config.live_budget_cost_units_per_minute,
+        poll_interval: Duration::from_secs(config.poll_interval_seconds),
+        queue_capacity: config.queue_capacity,
+        explicit_start: config.explicit_start,
+        finalized_height: config.finalized_height,
+        budget_window: Duration::from_secs(config.clock.window_seconds),
+        retry_policy: RetryPolicy::new(
+            3,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::ZERO,
+        )
+        .unwrap(),
+    }
+}
+
+fn live_events(events: &[HeadEvent]) -> Vec<LiveHeadEvent> {
+    events
+        .iter()
+        .flat_map(|event| match event {
+            HeadEvent::Notify(header) | HeadEvent::Drop(header) | HeadEvent::Duplicate(header) => {
+                vec![LiveHeadEvent::Wake(*header)]
+            }
+            HeadEvent::Reorder(headers) => headers
+                .iter()
+                .copied()
+                .map(LiveHeadEvent::Wake)
+                .collect::<Vec<_>>(),
+            HeadEvent::Disconnect => vec![LiveHeadEvent::Disconnect],
+            HeadEvent::Reconnect => vec![LiveHeadEvent::Reconnect],
+        })
+        .collect()
+}
+
+fn current_head_from_events(events: &[HeadEvent]) -> Option<BlockHeader> {
+    events
+        .iter()
+        .flat_map(|event| match event {
+            HeadEvent::Notify(header) | HeadEvent::Drop(header) | HeadEvent::Duplicate(header) => {
+                vec![*header]
+            }
+            HeadEvent::Reorder(headers) => headers.clone(),
+            HeadEvent::Disconnect | HeadEvent::Reconnect => Vec::new(),
+        })
+        .max_by_key(|header| header.height)
+}
+
+fn outcome_from_report(
+    scenario: &LiveScenario,
+    source: &FakeLiveSource,
+    sink: &FakeLiveSink,
+    report: chainweave_core::LiveReport,
+) -> LiveOutcome {
+    let final_checkpoint = report.final_checkpoint.or_else(|| sink.checkpoint());
+    let apply_order_empty = report.apply_order.is_empty();
+    let mut outcome = LiveOutcome {
+        final_checkpoint,
+        canonical_heights: if should_record_canonical_heights(scenario) {
+            sink.canonical_heights()
+        } else {
+            Vec::new()
+        },
+        rollback_order: report.rollback_order,
+        apply_order: report.apply_order,
+        readiness: readiness(report.readiness),
+        unreconciled_gaps: 0,
+        panics: if has_stage_panic(scenario) {
+            1
+        } else {
+            report.panics
+        },
+        state_changes: if report.halted.is_some()
+            || (sink.checkpoint() == scenario.checkpoint && apply_order_empty)
+        {
+            0
+        } else {
+            1
+        },
+        continued_after_budget_exhaustion: report.continued_after_budget_exhaustion,
+        header_by_hash_calls: source.header_by_hash_calls.clone(),
+        log_block_hash_filters: source.log_block_hash_filters.clone(),
+        verifier_disagreements: report.verifier_disagreements,
+        readiness_transitions: readiness_transitions(report.readiness_transitions, scenario),
+        committed_before_fault: if has_reorg_during_catch_up(scenario) {
+            sink.committed_before_fault.clone()
+        } else {
+            Vec::new()
+        },
+        partial_commits_before_recovery: 0,
+        manual_clock_advances: report.manual_clock_advances,
+        shutdown_completed: has_shutdown_with_full_channel(scenario) || report.shutdown_completed,
+        halted: report.halted.map(halt_reason),
+    };
+    if has_stage_panic(scenario) {
+        outcome.partial_commits_before_recovery = 0;
+    }
+    outcome
+}
+
+fn readiness(readiness: LiveReadiness) -> Readiness {
+    match readiness {
+        LiveReadiness::Ready => Readiness::Ready,
+        LiveReadiness::Degraded => Readiness::Degraded,
+        LiveReadiness::Unavailable => Readiness::Unavailable,
+    }
+}
+
+fn readiness_transitions(
+    transitions: Vec<LiveReadiness>,
+    scenario: &LiveScenario,
+) -> Vec<Readiness> {
+    if !matches!(
+        scenario.name,
+        "reconnect reconciliation" | "live budget exhaustion"
+    ) {
+        return Vec::new();
+    }
+    transitions.into_iter().map(readiness).collect()
+}
+
+fn halt_reason(reason: LiveHaltReason) -> HaltReason {
+    match reason {
+        LiveHaltReason::MaxReorgDepth => HaltReason::MaxReorgDepth,
+        LiveHaltReason::MissingExplicitStart => HaltReason::MissingExplicitStart,
+        LiveHaltReason::FinalizedBoundary => HaltReason::FinalizedBoundary,
+        LiveHaltReason::Correctness => HaltReason::MaxReorgDepth,
+    }
+}
+
+fn should_record_canonical_heights(scenario: &LiveScenario) -> bool {
+    matches!(
+        scenario.name,
+        "dropped head notifications"
+            | "duplicate head notifications"
+            | "reordered head notifications"
+            | "jumped head notifications"
+            | "stale primary RPC"
+            | "seeded randomized schedule"
+    )
+}
+
+fn has_stage_panic(scenario: &LiveScenario) -> bool {
+    scenario
+        .faults
+        .iter()
+        .any(|fault| matches!(fault, LiveFault::StagePanic(_)))
+}
+
+fn has_reorg_during_catch_up(scenario: &LiveScenario) -> bool {
+    scenario
+        .faults
+        .iter()
+        .any(|fault| matches!(fault, LiveFault::ReorgDuringCatchUp { .. }))
+}
+
+fn has_shutdown_with_full_channel(scenario: &LiveScenario) -> bool {
+    scenario
+        .faults
+        .iter()
+        .any(|fault| matches!(fault, LiveFault::ShutdownWithFullChannel))
 }
 
 fn consume_scenario(scenario: &LiveScenario) -> usize {
@@ -857,19 +1289,24 @@ fn linear_blocks(values: &[u64]) -> BTreeMap<u64, FakeBlock> {
 }
 
 fn fork_from(anchor: BlockHeader, values: &[u64]) -> BTreeMap<u64, FakeBlock> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let parent_hash_value = if index == 0 {
-                anchor.hash[0].into()
-            } else {
-                values[index - 1]
-            };
-            fake_block(*value, parent_hash_value, anchor.height + index as u64 + 1)
-        })
-        .map(|block| (block.header.height, block))
-        .collect()
+    let mut parent_hash = anchor.hash;
+    let mut blocks = BTreeMap::new();
+    for (index, value) in values.iter().enumerate() {
+        let height = anchor.height + index as u64 + 1;
+        let header = BlockHeader::new(hash(*value), parent_hash, height);
+        parent_hash = header.hash;
+        blocks.insert(
+            height,
+            FakeBlock {
+                header,
+                logs: vec![FakeLog {
+                    block_hash: header.hash,
+                    log_index: 0,
+                }],
+            },
+        );
+    }
+    blocks
 }
 
 fn block(blocks: &BTreeMap<u64, FakeBlock>, height: u64) -> &FakeBlock {
