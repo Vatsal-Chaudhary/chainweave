@@ -432,7 +432,7 @@ impl ReconnectLoop {
         Self {
             policy,
             attempt: 0,
-            readiness: RuntimeReadiness::Ready,
+            readiness: RuntimeReadiness::Unavailable,
             halted: false,
         }
     }
@@ -859,6 +859,7 @@ mod tests {
         .unwrap();
         let mut reconnect = ReconnectLoop::new(policy);
 
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
         reconnect.record_disconnect();
         assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
         reconnect.record_connected_needs_reconciliation();
