@@ -340,6 +340,150 @@ impl WindowedLiveBudget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeReadiness {
+    Ready,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectAction {
+    RetryAfter(Duration),
+    Halt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    pub jitter: Duration,
+}
+
+impl ReconnectPolicy {
+    /// Builds the unbounded reconnect policy used by live WebSocket supervision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when delays are zero or the cap is below the base delay.
+    pub fn new(
+        base_delay: Duration,
+        max_delay: Duration,
+        jitter: Duration,
+    ) -> Result<Self, LiveRuntimeError> {
+        if base_delay.is_zero() || max_delay.is_zero() {
+            return Err(LiveRuntimeError::Budget(
+                "reconnect delays must be nonzero".to_owned(),
+            ));
+        }
+        if base_delay > max_delay {
+            return Err(LiveRuntimeError::Budget(
+                "reconnect base delay must not exceed max delay".to_owned(),
+            ));
+        }
+        Ok(Self {
+            base_delay,
+            max_delay,
+            jitter,
+        })
+    }
+
+    #[must_use]
+    pub fn delay_for_attempt(self, attempt: u64) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(31);
+        let multiplier = 1_u64.checked_shl(exponent as u32).unwrap_or(u64::MAX);
+        let exponential = saturating_duration_mul(self.base_delay, multiplier).min(self.max_delay);
+        exponential
+            .saturating_add(self.jitter_for_attempt(attempt))
+            .min(self.max_delay)
+    }
+
+    fn jitter_for_attempt(self, attempt: u64) -> Duration {
+        let jitter_nanos = self.jitter.as_nanos().min(u128::from(u64::MAX)) as u64;
+        if jitter_nanos == 0 {
+            return Duration::ZERO;
+        }
+        let mixed = attempt
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        Duration::from_nanos(mixed % (jitter_nanos + 1))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconnectLoop {
+    policy: ReconnectPolicy,
+    attempt: u64,
+    readiness: RuntimeReadiness,
+    halted: bool,
+}
+
+impl ReconnectLoop {
+    #[must_use]
+    pub const fn new(policy: ReconnectPolicy) -> Self {
+        Self {
+            policy,
+            attempt: 0,
+            readiness: RuntimeReadiness::Ready,
+            halted: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn readiness(&self) -> RuntimeReadiness {
+        self.readiness
+    }
+
+    #[must_use]
+    pub const fn attempts(&self) -> u64 {
+        self.attempt
+    }
+
+    #[must_use]
+    pub const fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn record_disconnect(&mut self) {
+        self.readiness = RuntimeReadiness::Unavailable;
+    }
+
+    pub fn record_connected_needs_reconciliation(&mut self) {
+        self.readiness = RuntimeReadiness::Unavailable;
+    }
+
+    pub fn record_catch_up_complete(&mut self) {
+        if !self.halted {
+            self.attempt = 0;
+            self.readiness = RuntimeReadiness::Ready;
+        }
+    }
+
+    #[must_use]
+    pub fn record_availability_failure(&mut self) -> ReconnectAction {
+        if self.halted {
+            return ReconnectAction::Halt;
+        }
+        self.readiness = RuntimeReadiness::Unavailable;
+        self.attempt = self.attempt.saturating_add(1);
+        ReconnectAction::RetryAfter(self.policy.delay_for_attempt(self.attempt))
+    }
+
+    #[must_use]
+    pub fn record_correctness_error(&mut self) -> ReconnectAction {
+        self.readiness = RuntimeReadiness::Unavailable;
+        self.halted = true;
+        ReconnectAction::Halt
+    }
+}
+
+fn saturating_duration_mul(duration: Duration, multiplier: u64) -> Duration {
+    let nanos = duration
+        .as_nanos()
+        .saturating_mul(u128::from(multiplier))
+        .min(u128::from(u64::MAX));
+    Duration::from_nanos(nanos as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +510,76 @@ mod tests {
                 .record_at(RpcMethod::GetBlockByNumber, start + Duration::from_secs(60))
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_unbounded_capped_and_jittered() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+
+        let ReconnectAction::RetryAfter(first) = reconnect.record_availability_failure() else {
+            panic!("availability failures retry");
+        };
+        let ReconnectAction::RetryAfter(second) = reconnect.record_availability_failure() else {
+            panic!("availability failures retry");
+        };
+        assert!(first >= Duration::from_secs(1));
+        assert!(second > first);
+
+        let mut last = second;
+        for _ in 0..128 {
+            let ReconnectAction::RetryAfter(delay) = reconnect.record_availability_failure() else {
+                panic!("availability failures keep retrying");
+            };
+            assert!(delay <= Duration::from_secs(10));
+            last = delay;
+        }
+        assert_eq!(last, Duration::from_secs(10));
+        assert_eq!(reconnect.attempts(), 130);
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+    }
+
+    #[test]
+    fn reconnect_readiness_stays_unavailable_until_catch_up_completes() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+
+        reconnect.record_disconnect();
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+        reconnect.record_connected_needs_reconciliation();
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+        reconnect.record_catch_up_complete();
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Ready);
+        assert_eq!(reconnect.attempts(), 0);
+    }
+
+    #[test]
+    fn correctness_error_halts_reconnect_loop() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+
+        assert_eq!(reconnect.record_correctness_error(), ReconnectAction::Halt);
+        assert!(reconnect.is_halted());
+        assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
+        assert_eq!(
+            reconnect.record_availability_failure(),
+            ReconnectAction::Halt
         );
     }
 }
