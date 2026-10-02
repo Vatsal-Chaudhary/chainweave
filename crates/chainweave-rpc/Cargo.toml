@@ -9,6 +9,7 @@ rust-version.workspace = true
 alloy.workspace = true
 chainweave-core = { path = "../chainweave-core" }
 chainweave-sink = { path = "../chainweave-sink" }
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

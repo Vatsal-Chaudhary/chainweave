@@ -19,6 +19,7 @@ anyhow = "1.0.100"
 axum = "0.8.8"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 figment = { version = "0.10.19", features = ["env", "toml"] }
+futures = "0.3.33"
 metrics = "0.24.3"
 metrics-exporter-prometheus = { version = "0.18.1", default-features = false, features = ["http-listener"] }
 serde = { version = "1.0.228", features = ["derive"] }
