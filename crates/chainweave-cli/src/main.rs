@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chainweave_core::{
@@ -33,6 +33,8 @@ struct Cli {
     expected_chain_id: Option<u64>,
     #[arg(long, global = true, requires = "expected_chain_id")]
     expected_genesis_hash: Option<String>,
+    #[arg(long, global = true)]
+    server_listen_addr: Option<SocketAddr>,
     #[command(subcommand)]
     command: Command,
 }
@@ -216,6 +218,9 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) -> Result<()> {
         }
         (None, None) => {}
         _ => bail!("expected chain ID and genesis hash must be provided together"),
+    }
+    if let Some(address) = cli.server_listen_addr {
+        config.server.listen_addr = address;
     }
     Ok(())
 }
@@ -930,6 +935,8 @@ mod tests {
             "11155111",
             "--expected-genesis-hash",
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--server-listen-addr",
+            "127.0.0.1:9911",
             "head",
         ])
         .unwrap();
@@ -938,6 +945,7 @@ mod tests {
         apply_cli_overrides(&mut config, &cli).unwrap();
 
         assert_eq!(config.rpc.primary_url.as_str(), "wss://rpc.example.com/ws");
+        assert_eq!(config.server.listen_addr, "127.0.0.1:9911".parse().unwrap());
         assert_eq!(config.expected_chain.unwrap().chain_id, 11_155_111);
     }
 

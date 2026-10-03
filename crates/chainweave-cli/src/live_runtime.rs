@@ -5,9 +5,10 @@ use std::{
 };
 
 use chainweave_core::{
-    AppConfig, BackfillRange, BlockHash, BlockHeader, ChainError, ChainIdentity, ConfigError,
-    FetchedRange, LiveStartPoint, OrderedCommitCoordinator, RetryPolicy, RpcBudget, RpcMethod,
-    ValidationProfile, redact_url,
+    AppConfig, BackfillRange, BlockHash, BlockHeader, ChainBatch, ChainError, ConfigError,
+    FetchedRange, LiveConfig, LiveReport, LiveSink, LiveSource, LiveStartPoint, LiveTracker,
+    OrderedCommitCoordinator, RangeCommitSink, RetryPolicy, RpcBudget, RpcMethod,
+    ValidationProfile, VerifierStatus, redact_url,
 };
 use chainweave_rpc::{
     ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
@@ -15,9 +16,9 @@ use chainweave_rpc::{
     retry_rpc_request, spawn_new_heads_wakeup,
 };
 use chainweave_sink::{
-    HealthState, IndexedBlock, LiveStatusSnapshot, ObservabilityError, ObservabilityServer,
-    PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError, QueueDepths,
-    ReconciliationError, ReconciliationSource, ReconciliationSummary,
+    DurableChainBatch, HealthState, IndexedBlock, LiveStatusSnapshot, ObservabilityError,
+    ObservabilityServer, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
+    QueueDepths,
 };
 use futures::FutureExt;
 use thiserror::Error;
@@ -40,8 +41,6 @@ pub enum LiveRuntimeError {
     Migration(String),
     #[error("observability server failed: {0}")]
     Observability(#[from] ObservabilityError),
-    #[error("startup reconciliation failed: {0}")]
-    Reconciliation(#[from] ReconciliationError),
     #[error(transparent)]
     Backfill(#[from] chainweave_core::BackfillError),
     #[error("checkpoint height {0} has no canonical header")]
@@ -277,38 +276,173 @@ impl RpcReconciliationSource {
     }
 }
 
-impl ReconciliationSource for RpcReconciliationSource {
-    async fn head(&mut self) -> Result<IndexedBlock, ReconciliationError> {
-        let header = self
-            .primary
-            .poll_head()
-            .await
-            .map_err(|error| ReconciliationError::Source(error.to_string()))?;
-        self.last_head = Some(header);
-        self.verify_head(header)
-            .await
-            .map_err(|error| ReconciliationError::Source(error.to_string()))?;
-        self.primary
-            .block_by_number(header.height)
-            .await
-            .map_err(|error| ReconciliationError::Source(error.to_string()))
-    }
-
-    async fn block_by_height(
-        &mut self,
-        height: u64,
-    ) -> Result<Option<IndexedBlock>, ReconciliationError> {
-        self.primary
-            .block_by_number(height)
-            .await
-            .map(Some)
-            .map_err(|error| ReconciliationError::Source(error.to_string()))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PostgresLiveStore {
     writer: PostgresChainWriter,
+}
+
+struct BlockingTrackerSource<'a> {
+    source: &'a mut RpcReconciliationSource,
+    handle: tokio::runtime::Handle,
+}
+
+impl<'a> BlockingTrackerSource<'a> {
+    fn new(source: &'a mut RpcReconciliationSource) -> Self {
+        Self {
+            source,
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn block_on<T>(
+        handle: &tokio::runtime::Handle,
+        future: impl std::future::Future<Output = Result<T, LiveRuntimeError>>,
+    ) -> Result<T, String> {
+        handle.block_on(future).map_err(|error| error.to_string())
+    }
+}
+
+impl LiveSource for BlockingTrackerSource<'_> {
+    type Block = IndexedBlock;
+    type Error = String;
+
+    fn current_head(&mut self) -> Result<BlockHeader, Self::Error> {
+        let handle = self.handle.clone();
+        let header = Self::block_on(&handle, self.source.primary.poll_head())?;
+        self.source.last_head = Some(header);
+        Self::block_on(&handle, self.source.verify_head(header))?;
+        Ok(header)
+    }
+
+    fn block_by_number(&mut self, height: u64) -> Result<Self::Block, Self::Error> {
+        let handle = self.handle.clone();
+        Self::block_on(&handle, self.source.primary.block_by_number(height))
+    }
+
+    fn block_by_hash(&mut self, hash: BlockHash) -> Result<Self::Block, Self::Error> {
+        let handle = self.handle.clone();
+        Self::block_on(&handle, self.source.primary.block_by_hash(hash))
+    }
+
+    fn header_by_number(&mut self, height: u64) -> Result<Option<BlockHeader>, Self::Error> {
+        let handle = self.handle.clone();
+        Self::block_on(&handle, self.source.primary.header_by_number(height)).map(Some)
+    }
+
+    fn header_by_hash(&mut self, hash: BlockHash) -> Result<Option<BlockHeader>, Self::Error> {
+        let handle = self.handle.clone();
+        Self::block_on(&handle, self.source.primary.header_by_hash(hash))
+    }
+
+    fn block_header(block: &Self::Block) -> BlockHeader {
+        block.header
+    }
+
+    fn block_logs_match_header(_block: &Self::Block) -> bool {
+        true
+    }
+
+    fn verify_recent(
+        &mut self,
+        height: u64,
+        hash: BlockHash,
+    ) -> Result<VerifierStatus, Self::Error> {
+        let Some(verifier) = &mut self.source.verifier else {
+            return Ok(VerifierStatus::Unavailable);
+        };
+        let handle = self.handle.clone();
+        match Self::block_on(&handle, verifier.header_by_number(height)) {
+            Ok(verifier) if verifier.hash == hash => Ok(VerifierStatus::Match),
+            Ok(_) => {
+                self.source.verifier_disagreements =
+                    self.source.verifier_disagreements.saturating_add(1);
+                Ok(VerifierStatus::Disagree)
+            }
+            Err(_) => Ok(VerifierStatus::Unavailable),
+        }
+    }
+}
+
+struct BlockingPostgresLiveSink {
+    store: PostgresLiveStore,
+    handle: tokio::runtime::Handle,
+    parent_anchor: Option<BlockHeader>,
+}
+
+impl BlockingPostgresLiveSink {
+    fn new(store: PostgresLiveStore, parent_anchor: Option<BlockHeader>) -> Self {
+        Self {
+            store,
+            handle: tokio::runtime::Handle::current(),
+            parent_anchor,
+        }
+    }
+
+    fn block_on<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, LiveRuntimeError>>,
+    ) -> Result<T, String> {
+        self.handle
+            .block_on(future)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl RangeCommitSink<IndexedBlock> for BlockingPostgresLiveSink {
+    type Error = String;
+
+    fn commit_range(&mut self, fetched: FetchedRange<IndexedBlock>) -> Result<(), Self::Error> {
+        let header = fetched
+            .headers
+            .last()
+            .copied()
+            .ok_or_else(|| "cannot commit empty live range".to_owned())?;
+        let block = fetched
+            .logs
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing live block payload".to_owned())?;
+        self.block_on(self.store.commit_one_block(self.parent_anchor, block))?;
+        self.parent_anchor = Some(header);
+        Ok(())
+    }
+}
+
+impl LiveSink<IndexedBlock> for BlockingPostgresLiveSink {
+    fn checkpoint(&self) -> Option<BlockHeader> {
+        self.handle
+            .block_on(self.store.checkpoint_header())
+            .ok()
+            .flatten()
+    }
+
+    fn canonical_header_at_height(&self, height: u64) -> Option<BlockHeader> {
+        self.handle
+            .block_on(self.store.canonical_header_at_height(height))
+            .ok()
+            .flatten()
+    }
+
+    fn canonical_header_by_hash(&self, hash: BlockHash) -> Option<BlockHeader> {
+        self.handle
+            .block_on(self.store.canonical_header_by_hash(hash))
+            .ok()
+            .flatten()
+    }
+
+    fn commit_batch(
+        &mut self,
+        batch: ChainBatch,
+        apply_blocks: Vec<IndexedBlock>,
+    ) -> Result<(), Self::Error> {
+        let durable = DurableChainBatch::from_chain_batch(&batch, apply_blocks)
+            .map_err(|error| error.to_string())?;
+        self.handle
+            .block_on(self.store.writer().apply_batch(&durable))
+            .map_err(|error| error.to_string())?;
+        self.parent_anchor = self.checkpoint();
+        Ok(())
+    }
 }
 
 /// Runs the real live runtime until SIGINT/SIGTERM or a fail-closed correctness error.
@@ -335,8 +469,7 @@ pub async fn run_live(
         budget_cost_units_per_window: options.budget_cost_units_per_window,
         filter: None,
     };
-    let primary_redacted = redact_url(&config.rpc.primary_url);
-    let verifier_redacted = config.rpc.verifier_url.as_ref().map(redact_url);
+    let (primary_redacted, verifier_redacted) = live_endpoint_labels(config);
     let health = HealthState::default();
     health
         .update_live_status(initial_status(
@@ -372,11 +505,12 @@ pub async fn run_live(
         let verifier_head =
             capture_target_head_with_retry(&verifier_client, retry_policy, options.rpc_timeout)
                 .await?;
-        let expected = ChainIdentity {
-            chain_id: primary_head.chain_id,
-            genesis_hash: primary_head.genesis_hash.to_string(),
-        };
-        RpcClient::verify_identity(&verifier_head, &expected)?;
+        verify_verifier_chain_identity(
+            primary_head.chain_id,
+            primary_head.genesis_hash.to_string(),
+            verifier_head.chain_id,
+            verifier_head.genesis_hash.to_string(),
+        )?;
         Some(verifier_client)
     } else {
         None
@@ -572,17 +706,16 @@ async fn reconcile_and_publish(
     unreconciled_gap_count: Option<u64>,
 ) -> Result<(), LiveRuntimeError> {
     reconnect.record_subscribed_for_wakeups();
-    let summary = reconcile_once(writer, source, options, max_reorg_depth).await?;
+    let report = reconcile_once(writer, source, options, max_reorg_depth).await?;
     reconnect.record_reconciled_to_head()?;
     reconnect.record_ready_after_reconnect_at(Instant::now())?;
     let gap_count = unreconciled_gap_count.unwrap_or_else(|| {
-        summary
+        report
             .final_checkpoint
-            .as_ref()
             .and_then(|checkpoint| {
                 source
                     .last_head()
-                    .map(|head| head.height.saturating_sub(checkpoint.last_height))
+                    .map(|head| head.height.saturating_sub(checkpoint.height))
             })
             .unwrap_or(0)
     });
@@ -597,61 +730,35 @@ async fn reconcile_once(
     source: &mut RpcReconciliationSource,
     options: &LiveCommandOptions,
     max_reorg_depth: u64,
-) -> Result<ReconciliationSummary, LiveRuntimeError> {
-    if writer.checkpoint().await?.is_some() {
-        return writer
-            .reconcile_to_head(source, max_reorg_depth)
-            .await
-            .map_err(Into::into);
-    }
-    let Some(start_block) = options.start_block else {
-        AppConfig::validate_live_start(None)?;
-        unreachable!("validate_live_start always errors for None");
+) -> Result<LiveReport, LiveRuntimeError> {
+    let checkpoint = PostgresLiveStore::new(writer.clone())
+        .checkpoint_header()
+        .await?;
+    let live_config = LiveConfig {
+        max_reorg_depth,
+        live_budget_cost_units_per_minute: options.budget_cost_units_per_window,
+        poll_interval: options.poll_interval,
+        queue_capacity: 1,
+        explicit_start: options.start_block,
+        finalized_height: None,
+        budget_window: options.budget_window,
+        retry_policy: RetryPolicy::new(
+            8,
+            Duration::from_millis(500),
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+        )?,
     };
-    bootstrap_from_explicit_start(writer, source, start_block).await
-}
-
-async fn bootstrap_from_explicit_start(
-    writer: &PostgresChainWriter,
-    source: &mut RpcReconciliationSource,
-    start_block: u64,
-) -> Result<ReconciliationSummary, LiveRuntimeError> {
-    let head = source.head().await?;
-    let mut parent_anchor: Option<BlockHeader> = None;
+    let tracker = LiveTracker::new(live_config);
     let store = PostgresLiveStore::new(writer.clone());
-    let mut applied_blocks = 0;
-    if start_block > head.header.height {
-        return Ok(ReconciliationSummary {
-            final_checkpoint: writer.checkpoint().await?,
-            ..ReconciliationSummary::default()
-        });
-    }
-    for height in start_block..=head.header.height {
-        let block = if height == head.header.height {
-            head.clone()
-        } else {
-            source
-                .block_by_height(height)
-                .await?
-                .ok_or(ReconciliationError::MissingSourceHeight(height))?
-        };
-        if let Some(parent) = parent_anchor
-            && block.header.parent_hash != parent.hash
-        {
-            return Err(ReconciliationError::BrokenSourceLink {
-                child_height: height,
-            }
-            .into());
-        }
-        let header = block.header;
-        store.commit_one_block(parent_anchor, block).await?;
-        parent_anchor = Some(header);
-        applied_blocks += 1;
-    }
-    Ok(ReconciliationSummary {
-        rolled_back_blocks: 0,
-        applied_blocks,
-        final_checkpoint: writer.checkpoint().await?,
+    tokio::task::block_in_place(move || {
+        let mut tracker_source = BlockingTrackerSource::new(source);
+        let mut tracker_sink = BlockingPostgresLiveSink::new(store, checkpoint);
+        tracker
+            .run(&mut tracker_source, &mut tracker_sink, std::iter::empty())
+            .map_err(|error| {
+                LiveRuntimeError::Pipeline(LivePipelineError::DatabaseTransient(error.to_string()))
+            })
     })
 }
 
@@ -674,15 +781,8 @@ async fn publish_status(
         })
         .unwrap_or(0);
     let verifier_disagreements = source.verifier_disagreements();
-    let reconnect_ready = reconnect.readiness() == RuntimeReadiness::Ready;
-    let ready = reconnect_ready && verifier_disagreements == 0 && unreconciled_gap_count == 0;
-    let readiness = if ready {
-        "ready"
-    } else if reconnect_ready {
-        "degraded"
-    } else {
-        "unavailable"
-    };
+    let (ready, readiness) =
+        readiness_from_reconnect(reconnect, verifier_disagreements, unreconciled_gap_count);
     health
         .update_live_status(LiveStatusSnapshot {
             healthy: !reconnect.is_halted(),
@@ -704,6 +804,50 @@ async fn publish_status(
         })
         .await;
     Ok(())
+}
+
+fn live_endpoint_labels(config: &AppConfig) -> (String, Option<String>) {
+    (
+        redact_url(&config.rpc.primary_url),
+        config.rpc.verifier_url.as_ref().map(redact_url),
+    )
+}
+
+fn verify_verifier_chain_identity(
+    primary_chain_id: u64,
+    primary_genesis_hash: String,
+    verifier_chain_id: u64,
+    verifier_genesis_hash: String,
+) -> Result<(), RpcError> {
+    if verifier_chain_id != primary_chain_id {
+        return Err(RpcError::ChainIdMismatch {
+            expected: primary_chain_id,
+            actual: verifier_chain_id,
+        });
+    }
+    if verifier_genesis_hash != primary_genesis_hash {
+        return Err(RpcError::InvalidGenesis(format!(
+            "verifier genesis hash {verifier_genesis_hash} does not match primary {primary_genesis_hash}"
+        )));
+    }
+    Ok(())
+}
+
+fn readiness_from_reconnect(
+    reconnect: &ReconnectLoop,
+    verifier_disagreements: u64,
+    unreconciled_gap_count: u64,
+) -> (bool, &'static str) {
+    let reconnect_ready = reconnect.readiness() == RuntimeReadiness::Ready;
+    let ready = reconnect_ready && verifier_disagreements == 0 && unreconciled_gap_count == 0;
+    let readiness = if ready {
+        "ready"
+    } else if reconnect_ready {
+        "degraded"
+    } else {
+        "unavailable"
+    };
+    (ready, readiness)
 }
 
 fn initial_status(primary_rpc_url: &str, verifier_rpc_url: Option<&str>) -> LiveStatusSnapshot {
@@ -1423,7 +1567,11 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::sync::Notify;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        sync::Notify,
+    };
 
     #[test]
     fn windowed_live_budget_returns_delay_until_window_rollover() {
@@ -1587,6 +1735,125 @@ mod tests {
         assert_eq!(reconnect.readiness(), RuntimeReadiness::Unavailable);
         reconnect.record_ready_after_reconnect_at(now).unwrap();
         assert_eq!(reconnect.readiness(), RuntimeReadiness::Ready);
+    }
+
+    #[test]
+    fn live_endpoint_labels_redact_log_inputs() {
+        let config = AppConfig {
+            rpc: chainweave_core::config::RpcConfig {
+                primary_url: Url::parse("wss://rpc.example/v3/path-secret").unwrap(),
+                verifier_url: Some(
+                    Url::parse("wss://verify.example/mainnet?api_key=query-secret").unwrap(),
+                ),
+            },
+            ..AppConfig::default()
+        };
+
+        let (primary, verifier) = live_endpoint_labels(&config);
+
+        assert!(!primary.contains("path-secret"));
+        assert!(!verifier.unwrap().contains("query-secret"));
+        assert!(primary.contains("redacted"));
+    }
+
+    #[test]
+    fn readiness_comes_from_reconnect_loop_state() {
+        let policy = ReconnectPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut reconnect = ReconnectLoop::new(policy);
+
+        assert_eq!(
+            readiness_from_reconnect(&reconnect, 0, 0),
+            (false, "unavailable")
+        );
+        reconnect.record_subscribed_for_wakeups();
+        reconnect.record_reconciled_to_head().unwrap();
+        reconnect
+            .record_ready_after_reconnect_at(Instant::now())
+            .unwrap();
+        assert_eq!(readiness_from_reconnect(&reconnect, 0, 0), (true, "ready"));
+        assert_eq!(
+            readiness_from_reconnect(&reconnect, 1, 0),
+            (false, "degraded")
+        );
+    }
+
+    #[test]
+    fn verifier_chain_identity_mismatch_is_rejected() {
+        let error = verify_verifier_chain_identity(
+            1,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            2,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RpcError::ChainIdMismatch {
+                expected: 1,
+                actual: 2
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_errors_health_and_metrics_do_not_expose_url_secrets() {
+        for url in [
+            Url::parse("ws://127.0.0.1:9/v3/path-secret").unwrap(),
+            Url::parse("ws://127.0.0.1:9/mainnet?api_key=query-secret").unwrap(),
+        ] {
+            let error = tokio::time::timeout(Duration::from_secs(2), connect_rpc(&url))
+                .await
+                .expect("connection attempt should finish")
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("path-secret"));
+            assert!(!error.contains("query-secret"));
+            assert!(error.contains("redacted"));
+        }
+
+        let health = HealthState::default();
+        health
+            .update_live_status(initial_status(
+                "wss://rpc.example/v3/redacted",
+                Some("wss://verify.example/mainnet?api_key=redacted"),
+            ))
+            .await;
+        let server = ObservabilityServer::bind("127.0.0.1:0".parse().unwrap(), health)
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let health_body = http_get(address, "/health").await;
+        let metrics_body = http_get(address, "/metrics").await;
+        server_task.abort();
+
+        for body in [health_body, metrics_body] {
+            assert!(!body.contains("path-secret"));
+            assert!(!body.contains("query-secret"));
+            assert!(!body.contains("api_key=query-secret"));
+        }
+    }
+
+    async fn http_get(address: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
     }
 
     #[test]
