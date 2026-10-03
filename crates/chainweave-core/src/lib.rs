@@ -12,7 +12,9 @@ pub use chain::{
     AncestryResolver, BlockHash, BlockHeader, ChainBatch, ChainError, ChainEvent, ChainState,
     ChainTransition, ResolverError,
 };
-pub use config::{AppConfig, ChainIdentity, ConfigError, ValidationProfile};
+pub use config::{
+    AppConfig, ChainIdentity, ConfigError, LiveStartPoint, ValidationProfile, redact_url,
+};
 pub use live::{
     LiveConfig, LiveError, LiveHaltReason, LiveHeadEvent, LiveReadiness, LiveReport, LiveSink,
     LiveSource, LiveTracker, VerifierStatus,

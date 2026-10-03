@@ -60,6 +60,12 @@ pub enum ValidationProfile {
     Workers,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveStartPoint {
+    Explicit(u64),
+    DurableCheckpoint,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]
@@ -184,6 +190,85 @@ impl AppConfig {
 
         Ok(())
     }
+
+    /// Validates live-worker settings that cannot be inferred from the general worker profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] when live mode has no durable or explicit start point.
+    pub fn validate_live_start(start_point: Option<LiveStartPoint>) -> Result<(), ConfigError> {
+        if start_point.is_none() {
+            return Err(invalid(
+                "live mode requires a durable checkpoint or an explicit --start-block",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Redacts URL secrets before they are logged, returned in errors, or exposed through health.
+///
+/// This intentionally handles common RPC URL shapes such as `/v2/<key>`, `/v3/<key>`, and query
+/// parameters named `api_key`, `key`, `token`, `secret`, or `password`.
+#[must_use]
+pub fn redact_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    if redacted.password().is_some() {
+        let _ = redacted.set_password(Some("redacted"));
+    }
+
+    let mut path_segments = redacted
+        .path_segments()
+        .map(|segments| segments.map(ToOwned::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for index in 0..path_segments.len() {
+        let previous = index
+            .checked_sub(1)
+            .and_then(|previous| path_segments.get(previous))
+            .map_or_else(String::new, Clone::clone)
+            .to_ascii_lowercase();
+        let current = path_segments[index].to_ascii_lowercase();
+        if matches!(previous.as_str(), "v2" | "v3" | "key" | "keys")
+            || current.contains("apikey")
+            || current.contains("api-key")
+        {
+            path_segments[index] = "redacted".to_owned();
+        }
+    }
+    if !path_segments.is_empty()
+        && let Ok(mut segments) = redacted.path_segments_mut()
+    {
+        segments.clear().extend(path_segments.iter().map(String::as_str));
+    }
+
+    let query_pairs = redacted
+        .query_pairs()
+        .map(|(key, value)| {
+            let lower = key.to_ascii_lowercase();
+            let value = if is_secret_query_key(&lower) {
+                "redacted".into()
+            } else {
+                value
+            };
+            (key.into_owned(), value.into_owned())
+        })
+        .collect::<Vec<_>>();
+    if redacted.query().is_some() {
+        redacted.query_pairs_mut().clear().extend_pairs(query_pairs);
+    }
+
+    redacted.to_string()
+}
+
+fn is_secret_query_key(key: &str) -> bool {
+    key == "key"
+        || key == "api_key"
+        || key == "apikey"
+        || key == "api-key"
+        || key.ends_with("_key")
+        || key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
 }
 
 fn validate_rpc_url(name: &str, url: &Url) -> Result<(), ConfigError> {
@@ -286,5 +371,31 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate(ValidationProfile::Head).is_err());
+    }
+
+    #[test]
+    fn rejects_live_mode_without_start_point() {
+        let error = AppConfig::validate_live_start(None).unwrap_err();
+
+        assert!(error.to_string().contains("explicit --start-block"));
+        AppConfig::validate_live_start(Some(LiveStartPoint::Explicit(10))).unwrap();
+        AppConfig::validate_live_start(Some(LiveStartPoint::DurableCheckpoint)).unwrap();
+    }
+
+    #[test]
+    fn redact_url_masks_keys_in_path_and_query() {
+        let path_key =
+            Url::parse("https://example.rpc/v3/super-secret-key?chain=sepolia").unwrap();
+        assert_eq!(
+            redact_url(&path_key),
+            "https://example.rpc/v3/redacted?chain=sepolia"
+        );
+
+        let query_key =
+            Url::parse("https://example.rpc/mainnet?api_key=super-secret-key&chain=1").unwrap();
+        assert_eq!(
+            redact_url(&query_key),
+            "https://example.rpc/mainnet?api_key=redacted&chain=1"
+        );
     }
 }
