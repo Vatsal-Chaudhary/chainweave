@@ -1333,8 +1333,9 @@ mod tests {
     use std::{env, process::Command, str::FromStr as _, time::Duration};
 
     use chainweave_core::{
-        AsyncRangeCommitSink, BackfillRange, BlockHeader, ChainBatch, ChainTransition,
-        OrderedCommitCoordinator,
+        AsyncRangeCommitSink, BackfillRange, BlockHeader, ChainBatch, ChainTransition, LiveConfig,
+        LiveSink, LiveSource, LiveTracker, OrderedCommitCoordinator, RangeCommitSink, RetryPolicy,
+        VerifierStatus,
     };
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
@@ -1645,6 +1646,50 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_tracker_with_real_writer_crash_gates_match_clean_run() {
+        let Some(clean_db) = TestDb::create().await else {
+            return;
+        };
+        clean_db
+            .writer
+            .ensure_chain_identity(hash(90))
+            .await
+            .unwrap();
+        seed_live_checkpoint(&clean_db.writer).await;
+        run_live_tracker_to_height(&clean_db.writer, 1, None).await;
+        let clean_state = durable_state_snapshot(&clean_db.writer).await;
+
+        for (mode, crash_point) in [
+            ("live_tracker_before_commit", CrashPoint::BeforeCommit),
+            ("live_tracker_after_commit", CrashPoint::AfterCommit),
+        ] {
+            let Some(db) = TestDb::create().await else {
+                clean_db.cleanup().await;
+                return;
+            };
+            db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+            seed_live_checkpoint(&db.writer).await;
+            let seed_state = durable_state_snapshot(&db.writer).await;
+
+            run_crash_child(&db, mode).await;
+            let crashed_state = durable_state_snapshot(&db.writer).await;
+            if crash_point == CrashPoint::BeforeCommit {
+                assert_eq!(crashed_state, seed_state);
+            } else {
+                assert_eq!(crashed_state, clean_state);
+            }
+
+            run_live_tracker_to_height(&db.writer, 1, None).await;
+
+            assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+            assert_checkpoint_references_canonical_block(&db.writer).await;
+            db.cleanup().await;
+        }
+
+        clean_db.cleanup().await;
+    }
+
     #[tokio::test]
     async fn graceful_shutdown_drains_queued_batches() {
         let Some(db) = TestDb::create().await else {
@@ -1721,6 +1766,14 @@ mod tests {
                     CrashPoint::BeforeCommit,
                 )
                 .await;
+                return;
+            }
+            "live_tracker_before_commit" => {
+                run_live_tracker_to_height(&writer, 1, Some(CrashPoint::BeforeCommit)).await;
+                return;
+            }
+            "live_tracker_after_commit" => {
+                run_live_tracker_to_height(&writer, 1, Some(CrashPoint::AfterCommit)).await;
                 return;
             }
             step if step.starts_with("step:") => {
@@ -1880,6 +1933,224 @@ mod tests {
                 .map_err(|error| error.to_string())?;
             self.parent_anchor = Some(last_header);
             Ok(())
+        }
+    }
+
+    struct MemoryLiveSource {
+        blocks: Vec<IndexedBlock>,
+    }
+
+    impl MemoryLiveSource {
+        fn new(blocks: impl IntoIterator<Item = IndexedBlock>) -> Self {
+            Self {
+                blocks: blocks.into_iter().collect(),
+            }
+        }
+    }
+
+    impl LiveSource for MemoryLiveSource {
+        type Block = IndexedBlock;
+        type Error = String;
+
+        fn current_head(&mut self) -> Result<BlockHeader, Self::Error> {
+            self.blocks
+                .last()
+                .map(|block| block.header)
+                .ok_or_else(|| "missing live head".to_owned())
+        }
+
+        fn block_by_number(&mut self, height: u64) -> Result<Self::Block, Self::Error> {
+            self.blocks
+                .iter()
+                .find(|block| block.header.height == height)
+                .cloned()
+                .ok_or_else(|| format!("missing block at height {height}"))
+        }
+
+        fn block_by_hash(&mut self, hash: BlockHash) -> Result<Self::Block, Self::Error> {
+            self.blocks
+                .iter()
+                .find(|block| block.header.hash == hash)
+                .cloned()
+                .ok_or_else(|| format!("missing block for hash {hash:?}"))
+        }
+
+        fn header_by_number(&mut self, height: u64) -> Result<Option<BlockHeader>, Self::Error> {
+            Ok(self
+                .blocks
+                .iter()
+                .find(|block| block.header.height == height)
+                .map(|block| block.header))
+        }
+
+        fn header_by_hash(&mut self, hash: BlockHash) -> Result<Option<BlockHeader>, Self::Error> {
+            Ok(self
+                .blocks
+                .iter()
+                .find(|block| block.header.hash == hash)
+                .map(|block| block.header))
+        }
+
+        fn block_header(block: &Self::Block) -> BlockHeader {
+            block.header
+        }
+
+        fn verify_recent(
+            &mut self,
+            _height: u64,
+            _hash: BlockHash,
+        ) -> Result<VerifierStatus, Self::Error> {
+            Ok(VerifierStatus::Unavailable)
+        }
+    }
+
+    struct CrashLiveSink {
+        writer: PostgresChainWriter,
+        parent_anchor: Option<BlockHeader>,
+        crash_point: Option<CrashPoint>,
+        handle: tokio::runtime::Handle,
+    }
+
+    impl CrashLiveSink {
+        fn apply(&self, durable: &DurableChainBatch) -> Result<(), String> {
+            let writer = self.writer.clone();
+            let crash_point = self.crash_point;
+            self.handle
+                .block_on(async move {
+                    if let Some(crash_point) = crash_point {
+                        writer
+                            .apply_batch_with_crash_point(durable, crash_point)
+                            .await
+                    } else {
+                        writer.apply_batch(durable).await
+                    }
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    impl RangeCommitSink<IndexedBlock> for CrashLiveSink {
+        type Error = String;
+
+        fn commit_range(&mut self, fetched: FetchedRange<IndexedBlock>) -> Result<(), Self::Error> {
+            let headers = fetched.headers;
+            let blocks = fetched.logs;
+            let last_header = headers
+                .last()
+                .copied()
+                .ok_or_else(|| "cannot commit empty live range".to_owned())?;
+            let events = headers.into_iter().map(ChainEvent::Apply).collect();
+            let transition = if self.parent_anchor.is_some() {
+                ChainTransition::Gap
+            } else {
+                ChainTransition::Bootstrap
+            };
+            let batch = ChainBatch {
+                transition,
+                common_ancestor: self.parent_anchor,
+                events,
+            };
+            let durable = DurableChainBatch::from_chain_batch(&batch, blocks)
+                .map_err(|error| error.to_string())?;
+            self.apply(&durable)?;
+            self.parent_anchor = Some(last_header);
+            Ok(())
+        }
+    }
+
+    impl LiveSink<IndexedBlock> for CrashLiveSink {
+        fn checkpoint(&self) -> Option<BlockHeader> {
+            self.handle
+                .block_on(optional_durable_checkpoint_header(&self.writer))
+        }
+
+        fn canonical_header_at_height(&self, height: u64) -> Option<BlockHeader> {
+            self.handle
+                .block_on(self.writer.canonical_header_at_height(height))
+                .unwrap()
+        }
+
+        fn canonical_header_by_hash(&self, hash: BlockHash) -> Option<BlockHeader> {
+            self.handle
+                .block_on(self.writer.canonical_header_by_hash(hash))
+                .unwrap()
+        }
+
+        fn commit_batch(
+            &mut self,
+            batch: ChainBatch,
+            apply_blocks: Vec<IndexedBlock>,
+        ) -> Result<(), Self::Error> {
+            let durable = DurableChainBatch::from_chain_batch(&batch, apply_blocks)
+                .map_err(|error| error.to_string())?;
+            self.apply(&durable)
+        }
+    }
+
+    async fn seed_live_checkpoint(writer: &PostgresChainWriter) {
+        writer
+            .apply_batch(&batch(None, [apply_block(0, 0)]))
+            .await
+            .unwrap();
+    }
+
+    async fn run_live_tracker_to_height(
+        writer: &PostgresChainWriter,
+        height: u64,
+        crash_point: Option<CrashPoint>,
+    ) {
+        let blocks = (0..=height)
+            .map(|height| {
+                let value = u8::try_from(height).unwrap();
+                block(value, value.saturating_sub(1))
+            })
+            .collect::<Vec<_>>();
+        let parent_anchor = optional_durable_checkpoint_header(writer).await;
+        let writer = writer.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let mut source = MemoryLiveSource::new(blocks);
+            let mut sink = CrashLiveSink {
+                writer,
+                parent_anchor,
+                crash_point,
+                handle,
+            };
+            let tracker = LiveTracker::new(test_live_config());
+            tracker
+                .run(&mut source, &mut sink, std::iter::empty())
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn optional_durable_checkpoint_header(
+        writer: &PostgresChainWriter,
+    ) -> Option<BlockHeader> {
+        let checkpoint = writer.checkpoint().await.unwrap()?;
+        writer
+            .canonical_header_at_height(checkpoint.last_height)
+            .await
+            .unwrap()
+    }
+
+    fn test_live_config() -> LiveConfig {
+        LiveConfig {
+            max_reorg_depth: 2_048,
+            live_budget_cost_units_per_minute: 1_200,
+            poll_interval: Duration::from_secs(12),
+            explicit_start: Some(0),
+            finalized_height: None,
+            budget_window: Duration::from_secs(60),
+            retry_policy: RetryPolicy::new(
+                3,
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+                Duration::ZERO,
+            )
+            .unwrap(),
         }
     }
 
