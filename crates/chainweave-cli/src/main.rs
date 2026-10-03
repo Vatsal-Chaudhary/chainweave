@@ -66,6 +66,21 @@ enum Command {
         #[arg(long)]
         rpc_max_cost_units: Option<u64>,
     },
+    /// Run live tip tracking from a durable checkpoint or an explicit start block.
+    Live {
+        #[arg(long)]
+        start_block: Option<u64>,
+        #[arg(long, default_value_t = 12_000)]
+        poll_interval_ms: u64,
+        #[arg(long, default_value_t = 30_000)]
+        rpc_timeout_ms: u64,
+        #[arg(long, default_value_t = 60)]
+        budget_window_secs: u64,
+        #[arg(long, default_value_t = 1_200)]
+        budget_cost_units: u64,
+        #[arg(long, default_value_t = 30_000)]
+        shutdown_timeout_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +119,26 @@ async fn main() -> Result<()> {
                 rpc_max_cost_units,
             };
             run_backfill(&config, options).await
+        }
+        Command::Live {
+            start_block,
+            poll_interval_ms,
+            rpc_timeout_ms,
+            budget_window_secs,
+            budget_cost_units,
+            shutdown_timeout_ms,
+        } => {
+            let options = live_runtime::LiveCommandOptions {
+                start_block,
+                poll_interval: Duration::from_millis(poll_interval_ms),
+                rpc_timeout: Duration::from_millis(rpc_timeout_ms),
+                budget_window: Duration::from_secs(budget_window_secs),
+                budget_cost_units_per_window: budget_cost_units,
+                shutdown_timeout: Duration::from_millis(shutdown_timeout_ms),
+            };
+            live_runtime::run_live(&config, options)
+                .await
+                .map_err(Into::into)
         }
     }
 }
@@ -930,6 +965,40 @@ mod tests {
         };
         assert_eq!(from_block, 100);
         assert_eq!(to_block, 200);
+    }
+
+    #[test]
+    fn cli_parses_live_runtime_knobs() {
+        let cli = Cli::try_parse_from([
+            "chainweave",
+            "--rpc-url",
+            "ws://127.0.0.1:8545",
+            "live",
+            "--start-block",
+            "500",
+            "--poll-interval-ms",
+            "250",
+            "--budget-window-secs",
+            "5",
+            "--budget-cost-units",
+            "99",
+        ])
+        .unwrap();
+
+        let Command::Live {
+            start_block,
+            poll_interval_ms,
+            budget_window_secs,
+            budget_cost_units,
+            ..
+        } = cli.command
+        else {
+            panic!("expected live command");
+        };
+        assert_eq!(start_block, Some(500));
+        assert_eq!(poll_interval_ms, 250);
+        assert_eq!(budget_window_secs, 5);
+        assert_eq!(budget_cost_units, 99);
     }
 
     #[tokio::test]

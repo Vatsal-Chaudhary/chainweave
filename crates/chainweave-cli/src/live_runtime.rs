@@ -5,27 +5,43 @@ use std::{
 };
 
 use chainweave_core::{
-    BackfillRange, BlockHash, BlockHeader, ChainError, FetchedRange, OrderedCommitCoordinator,
-    RetryPolicy, RpcBudget, RpcMethod,
+    AppConfig, BackfillRange, BlockHash, BlockHeader, ChainError, ChainIdentity, ConfigError,
+    FetchedRange, LiveStartPoint, OrderedCommitCoordinator, RetryPolicy, RpcBudget, RpcMethod,
+    ValidationProfile, redact_url,
 };
 use chainweave_rpc::{
     ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
-    fetch_header_by_hash_with_retry, fetch_header_by_number_with_retry, retry_rpc_request,
+    fetch_header_by_hash_with_retry, fetch_header_by_number_with_retry, new_head_wakeup_channel,
+    retry_rpc_request, spawn_new_heads_wakeup,
 };
 use chainweave_sink::{
-    IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
+    HealthState, IndexedBlock, LiveStatusSnapshot, ObservabilityError, ObservabilityServer,
+    PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError, QueueDepths,
+    ReconciliationError, ReconciliationSource, ReconciliationSummary,
 };
 use futures::FutureExt;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{signal, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+use url::Url;
 
 #[derive(Debug, Error)]
 pub enum LiveRuntimeError {
+    #[error("configuration validation failed: {0}")]
+    Config(#[from] ConfigError),
+    #[error("RPC endpoint {endpoint} failed: {source}")]
+    RpcEndpoint { endpoint: String, source: RpcError },
     #[error(transparent)]
     Rpc(#[from] RpcError),
     #[error(transparent)]
     Sink(#[from] PostgresStateError),
+    #[error("database migration failed: {0}")]
+    Migration(String),
+    #[error("observability server failed: {0}")]
+    Observability(#[from] ObservabilityError),
+    #[error("startup reconciliation failed: {0}")]
+    Reconciliation(#[from] ReconciliationError),
     #[error(transparent)]
     Backfill(#[from] chainweave_core::BackfillError),
     #[error("checkpoint height {0} has no canonical header")]
@@ -38,6 +54,29 @@ pub enum LiveRuntimeError {
     ReconnectOrder(String),
     #[error(transparent)]
     Pipeline(#[from] LivePipelineError),
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveCommandOptions {
+    pub start_block: Option<u64>,
+    pub poll_interval: Duration,
+    pub rpc_timeout: Duration,
+    pub budget_window: Duration,
+    pub budget_cost_units_per_window: u64,
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for LiveCommandOptions {
+    fn default() -> Self {
+        Self {
+            start_block: None,
+            poll_interval: Duration::from_secs(12),
+            rpc_timeout: Duration::from_secs(30),
+            budget_window: Duration::from_secs(60),
+            budget_cost_units_per_window: 1_200,
+            shutdown_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,9 +234,535 @@ impl RpcLiveSource {
     }
 }
 
+#[derive(Debug)]
+struct RpcReconciliationSource {
+    primary: RpcLiveSource,
+    verifier: Option<RpcLiveSource>,
+    verifier_disagreements: u64,
+    last_head: Option<BlockHeader>,
+}
+
+impl RpcReconciliationSource {
+    fn new(primary: RpcLiveSource, verifier: Option<RpcLiveSource>) -> Self {
+        Self {
+            primary,
+            verifier,
+            verifier_disagreements: 0,
+            last_head: None,
+        }
+    }
+
+    const fn verifier_disagreements(&self) -> u64 {
+        self.verifier_disagreements
+    }
+
+    const fn last_head(&self) -> Option<BlockHeader> {
+        self.last_head
+    }
+
+    async fn verify_head(&mut self, primary: BlockHeader) -> Result<(), LiveRuntimeError> {
+        let Some(verifier) = &mut self.verifier else {
+            return Ok(());
+        };
+        match verifier.header_by_number(primary.height).await {
+            Ok(verifier) if verifier.hash != primary.hash => {
+                self.verifier_disagreements = self.verifier_disagreements.saturating_add(1);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                self.verifier_disagreements = self.verifier_disagreements.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ReconciliationSource for RpcReconciliationSource {
+    async fn head(&mut self) -> Result<IndexedBlock, ReconciliationError> {
+        let header = self
+            .primary
+            .poll_head()
+            .await
+            .map_err(|error| ReconciliationError::Source(error.to_string()))?;
+        self.last_head = Some(header);
+        self.verify_head(header)
+            .await
+            .map_err(|error| ReconciliationError::Source(error.to_string()))?;
+        self.primary
+            .block_by_number(header.height)
+            .await
+            .map_err(|error| ReconciliationError::Source(error.to_string()))
+    }
+
+    async fn block_by_height(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<IndexedBlock>, ReconciliationError> {
+        self.primary
+            .block_by_number(height)
+            .await
+            .map(Some)
+            .map_err(|error| ReconciliationError::Source(error.to_string()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostgresLiveStore {
     writer: PostgresChainWriter,
+}
+
+/// Runs the real live runtime until SIGINT/SIGTERM or a fail-closed correctness error.
+///
+/// # Errors
+///
+/// Returns an error when configuration, RPC identity, Postgres state, reconciliation, or the
+/// observability server fails.
+pub async fn run_live(
+    config: &AppConfig,
+    options: LiveCommandOptions,
+) -> Result<(), LiveRuntimeError> {
+    config.validate(ValidationProfile::Workers)?;
+    let retry_policy = RetryPolicy::new(
+        8,
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+    )?;
+    let runtime_config = RuntimeLiveConfig {
+        retry_policy,
+        rpc_timeout: options.rpc_timeout,
+        budget_window: options.budget_window,
+        budget_cost_units_per_window: options.budget_cost_units_per_window,
+        filter: None,
+    };
+    let primary_redacted = redact_url(&config.rpc.primary_url);
+    let verifier_redacted = config.rpc.verifier_url.as_ref().map(redact_url);
+    let health = HealthState::default();
+    health
+        .update_live_status(initial_status(
+            &primary_redacted,
+            verifier_redacted.as_deref(),
+        ))
+        .await;
+    let observability =
+        ObservabilityServer::bind(config.server.listen_addr, health.clone()).await?;
+    let observability_addr = observability
+        .local_addr()
+        .map_err(ObservabilityError::Serve)?;
+    let shutdown = CancellationToken::new();
+    spawn_shutdown_signal(shutdown.clone());
+    let observability_task = tokio::spawn(observability.serve());
+
+    info!(
+        primary_rpc = %primary_redacted,
+        verifier_rpc = verifier_redacted.as_deref().unwrap_or("none"),
+        observability_addr = %observability_addr,
+        "starting live runner"
+    );
+
+    let primary_client = connect_rpc(&config.rpc.primary_url).await?;
+    let primary_head =
+        capture_target_head_with_retry(&primary_client, retry_policy, options.rpc_timeout).await?;
+    if let Some(expected) = &config.expected_chain {
+        RpcClient::verify_identity(&primary_head, expected)?;
+    }
+
+    let verifier_client = if let Some(url) = &config.rpc.verifier_url {
+        let verifier_client = connect_rpc(url).await?;
+        let verifier_head =
+            capture_target_head_with_retry(&verifier_client, retry_policy, options.rpc_timeout)
+                .await?;
+        let expected = ChainIdentity {
+            chain_id: primary_head.chain_id,
+            genesis_hash: primary_head.genesis_hash.to_string(),
+        };
+        RpcClient::verify_identity(&verifier_head, &expected)?;
+        Some(verifier_client)
+    } else {
+        None
+    };
+
+    let database_url = config.database_url.as_deref().ok_or_else(|| {
+        ConfigError::Invalid("database_url is required before live mode".to_owned())
+    })?;
+    let writer = PostgresChainWriter::connect(database_url, primary_head.chain_id).await?;
+    writer
+        .run_migrations()
+        .await
+        .map_err(|error| LiveRuntimeError::Migration(error.to_string()))?;
+    writer
+        .ensure_chain_identity(primary_head.genesis_block_hash())
+        .await?;
+    let checkpoint = writer.checkpoint().await?;
+    let start_point = checkpoint
+        .as_ref()
+        .map(|_| LiveStartPoint::DurableCheckpoint)
+        .or_else(|| options.start_block.map(LiveStartPoint::Explicit));
+    AppConfig::validate_live_start(start_point)?;
+
+    let policy = ReconnectPolicy::new(
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+    )?;
+    let mut reconnect = ReconnectLoop::new(policy);
+    let (wakeups, mut wakeup_rx) = new_head_wakeup_channel();
+    let mut new_heads_task = if is_ws_url(&config.rpc.primary_url) {
+        reconnect.record_subscribed_for_wakeups();
+        Some(spawn_new_heads_wakeup(
+            config.rpc.primary_url.clone(),
+            wakeups.clone(),
+        ))
+    } else {
+        reconnect.record_subscribed_for_wakeups();
+        None
+    };
+
+    let primary_source = RpcLiveSource::new(primary_client, runtime_config.clone())?;
+    let verifier_source = verifier_client
+        .map(|client| RpcLiveSource::new(client, runtime_config.clone()))
+        .transpose()?;
+    let mut source = RpcReconciliationSource::new(primary_source, verifier_source);
+    let mut poll = tokio::time::interval(options.poll_interval);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    reconcile_and_publish(
+        &writer,
+        &mut source,
+        &options,
+        config.indexer.max_reorg_depth,
+        &mut reconnect,
+        &health,
+        &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+        &wakeup_rx,
+        None,
+    )
+    .await?;
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => {
+                reconnect.record_disconnect();
+                publish_status(
+                    &writer,
+                    &source,
+                    &reconnect,
+                    &health,
+                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                    &wakeup_rx,
+                    0,
+                ).await?;
+                if let Some(task) = &new_heads_task {
+                    task.abort();
+                }
+                observability_task.abort();
+                tokio::time::sleep(options.shutdown_timeout.min(Duration::from_millis(50))).await;
+                return Ok(());
+            }
+            _ = poll.tick() => {
+                reconcile_and_publish(
+                    &writer,
+                    &mut source,
+                    &options,
+                    config.indexer.max_reorg_depth,
+                    &mut reconnect,
+                    &health,
+                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                    &wakeup_rx,
+                    None,
+                ).await?;
+            }
+            maybe_wakeup = wakeup_rx.recv() => {
+                if maybe_wakeup.is_some() {
+                    reconcile_and_publish(
+                        &writer,
+                        &mut source,
+                        &options,
+                        config.indexer.max_reorg_depth,
+                        &mut reconnect,
+                        &health,
+                        &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                        &wakeup_rx,
+                        None,
+                    ).await?;
+                }
+            }
+            joined = async {
+                match &mut new_heads_task {
+                    Some(task) => Some(task.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                reconnect.record_disconnect();
+                publish_status(
+                    &writer,
+                    &source,
+                    &reconnect,
+                    &health,
+                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                    &wakeup_rx,
+                    0,
+                ).await?;
+                warn!(result = ?joined, "newHeads subscription ended; reconnecting after backoff");
+                let ReconnectAction::RetryAfter(delay) = reconnect.record_availability_failure() else {
+                    return Ok(());
+                };
+                tokio::time::sleep(delay).await;
+                reconnect.record_subscribed_for_wakeups();
+                new_heads_task = if is_ws_url(&config.rpc.primary_url) {
+                    Some(spawn_new_heads_wakeup(
+                        config.rpc.primary_url.clone(),
+                        wakeups.clone(),
+                    ))
+                } else {
+                    None
+                };
+                reconcile_and_publish(
+                    &writer,
+                    &mut source,
+                    &options,
+                    config.indexer.max_reorg_depth,
+                    &mut reconnect,
+                    &health,
+                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                    &wakeup_rx,
+                    None,
+                ).await?;
+            }
+        }
+    }
+}
+
+struct StatusContext<'a> {
+    primary_rpc_url: &'a str,
+    verifier_rpc_url: Option<&'a str>,
+    queue_capacities: QueueDepths,
+}
+
+impl<'a> StatusContext<'a> {
+    fn new(
+        config: &AppConfig,
+        primary_rpc_url: &'a str,
+        verifier_rpc_url: Option<&'a str>,
+    ) -> Self {
+        Self {
+            primary_rpc_url,
+            verifier_rpc_url,
+            queue_capacities: QueueDepths {
+                wakeups: 1,
+                fetch: config.queues.fetch,
+                coordinate: config.queues.coordinate,
+                decode: config.queues.decode,
+                write: config.queues.write,
+            },
+        }
+    }
+}
+
+async fn reconcile_and_publish(
+    writer: &PostgresChainWriter,
+    source: &mut RpcReconciliationSource,
+    options: &LiveCommandOptions,
+    max_reorg_depth: u64,
+    reconnect: &mut ReconnectLoop,
+    health: &HealthState,
+    context: &StatusContext<'_>,
+    wakeup_rx: &mpsc::Receiver<()>,
+    unreconciled_gap_count: Option<u64>,
+) -> Result<(), LiveRuntimeError> {
+    reconnect.record_subscribed_for_wakeups();
+    let summary = reconcile_once(writer, source, options, max_reorg_depth).await?;
+    reconnect.record_reconciled_to_head()?;
+    reconnect.record_ready_after_reconnect_at(Instant::now())?;
+    let gap_count = unreconciled_gap_count.unwrap_or_else(|| {
+        summary
+            .final_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| {
+                source
+                    .last_head()
+                    .map(|head| head.height.saturating_sub(checkpoint.last_height))
+            })
+            .unwrap_or(0)
+    });
+    publish_status(
+        writer, source, reconnect, health, context, wakeup_rx, gap_count,
+    )
+    .await
+}
+
+async fn reconcile_once(
+    writer: &PostgresChainWriter,
+    source: &mut RpcReconciliationSource,
+    options: &LiveCommandOptions,
+    max_reorg_depth: u64,
+) -> Result<ReconciliationSummary, LiveRuntimeError> {
+    if writer.checkpoint().await?.is_some() {
+        return writer
+            .reconcile_to_head(source, max_reorg_depth)
+            .await
+            .map_err(Into::into);
+    }
+    let Some(start_block) = options.start_block else {
+        AppConfig::validate_live_start(None)?;
+        unreachable!("validate_live_start always errors for None");
+    };
+    bootstrap_from_explicit_start(writer, source, start_block).await
+}
+
+async fn bootstrap_from_explicit_start(
+    writer: &PostgresChainWriter,
+    source: &mut RpcReconciliationSource,
+    start_block: u64,
+) -> Result<ReconciliationSummary, LiveRuntimeError> {
+    let head = source.head().await?;
+    let mut parent_anchor: Option<BlockHeader> = None;
+    let store = PostgresLiveStore::new(writer.clone());
+    let mut applied_blocks = 0;
+    if start_block > head.header.height {
+        return Ok(ReconciliationSummary {
+            final_checkpoint: writer.checkpoint().await?,
+            ..ReconciliationSummary::default()
+        });
+    }
+    for height in start_block..=head.header.height {
+        let block = if height == head.header.height {
+            head.clone()
+        } else {
+            source
+                .block_by_height(height)
+                .await?
+                .ok_or(ReconciliationError::MissingSourceHeight(height))?
+        };
+        if let Some(parent) = parent_anchor
+            && block.header.parent_hash != parent.hash
+        {
+            return Err(ReconciliationError::BrokenSourceLink {
+                child_height: height,
+            }
+            .into());
+        }
+        let header = block.header;
+        store.commit_one_block(parent_anchor, block).await?;
+        parent_anchor = Some(header);
+        applied_blocks += 1;
+    }
+    Ok(ReconciliationSummary {
+        rolled_back_blocks: 0,
+        applied_blocks,
+        final_checkpoint: writer.checkpoint().await?,
+    })
+}
+
+async fn publish_status(
+    writer: &PostgresChainWriter,
+    source: &RpcReconciliationSource,
+    reconnect: &ReconnectLoop,
+    health: &HealthState,
+    context: &StatusContext<'_>,
+    wakeup_rx: &mpsc::Receiver<()>,
+    unreconciled_gap_count: u64,
+) -> Result<(), LiveRuntimeError> {
+    let checkpoint = writer.checkpoint().await?;
+    let current_lag_blocks = source
+        .last_head()
+        .and_then(|head| {
+            checkpoint
+                .as_ref()
+                .map(|checkpoint| head.height.saturating_sub(checkpoint.last_height))
+        })
+        .unwrap_or(0);
+    let verifier_disagreements = source.verifier_disagreements();
+    let reconnect_ready = reconnect.readiness() == RuntimeReadiness::Ready;
+    let ready = reconnect_ready && verifier_disagreements == 0 && unreconciled_gap_count == 0;
+    let readiness = if ready {
+        "ready"
+    } else if reconnect_ready {
+        "degraded"
+    } else {
+        "unavailable"
+    };
+    health
+        .update_live_status(LiveStatusSnapshot {
+            healthy: !reconnect.is_halted(),
+            ready,
+            readiness: readiness.to_owned(),
+            primary_rpc_url: Some(context.primary_rpc_url.to_owned()),
+            verifier_rpc_url: context.verifier_rpc_url.map(ToOwned::to_owned),
+            current_lag_blocks,
+            reconnect_count: reconnect.attempts(),
+            queue_depths: QueueDepths {
+                wakeups: wakeup_rx.len(),
+                fetch: 0.min(context.queue_capacities.fetch),
+                coordinate: 0.min(context.queue_capacities.coordinate),
+                decode: 0.min(context.queue_capacities.decode),
+                write: 0.min(context.queue_capacities.write),
+            },
+            unreconciled_gap_count,
+            verifier_disagreement_count: verifier_disagreements,
+        })
+        .await;
+    Ok(())
+}
+
+fn initial_status(primary_rpc_url: &str, verifier_rpc_url: Option<&str>) -> LiveStatusSnapshot {
+    LiveStatusSnapshot {
+        healthy: false,
+        ready: false,
+        readiness: "unavailable".to_owned(),
+        primary_rpc_url: Some(primary_rpc_url.to_owned()),
+        verifier_rpc_url: verifier_rpc_url.map(ToOwned::to_owned),
+        current_lag_blocks: 0,
+        reconnect_count: 0,
+        queue_depths: QueueDepths::default(),
+        unreconciled_gap_count: 0,
+        verifier_disagreement_count: 0,
+    }
+}
+
+async fn connect_rpc(url: &Url) -> Result<RpcClient, LiveRuntimeError> {
+    RpcClient::connect(url)
+        .await
+        .map_err(|source| LiveRuntimeError::RpcEndpoint {
+            endpoint: redact_url(url),
+            source,
+        })
+}
+
+fn is_ws_url(url: &Url) -> bool {
+    matches!(url.scheme(), "ws" | "wss")
+}
+
+fn spawn_shutdown_signal(shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        shutdown.cancel();
+    });
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut stream) => {
+                    stream.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                let _ = result;
+            }
+            () = terminate => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
 }
 
 impl PostgresLiveStore {
@@ -858,6 +1423,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use tokio::sync::Notify;
 
     #[test]
     fn windowed_live_budget_returns_delay_until_window_rollover() {
@@ -1168,6 +1734,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(mutation_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_write_to_finish() {
+        let (write_tx, write_rx) = mpsc::channel(1);
+        write_tx.send(41_u64).await.unwrap();
+        drop(write_tx);
+        let shutdown = CancellationToken::new();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let started_for_writer = Arc::clone(&started);
+        let release_for_writer = Arc::clone(&release);
+        let completed_for_writer = Arc::clone(&completed);
+        let writer_shutdown = shutdown.clone();
+
+        let task = tokio::spawn(async move {
+            writer_stage(
+                write_rx,
+                move |_| {
+                    let started = Arc::clone(&started_for_writer);
+                    let release = Arc::clone(&release_for_writer);
+                    let completed = Arc::clone(&completed_for_writer);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                writer_shutdown,
+            )
+            .await
+        });
+
+        started.notified().await;
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!task.is_finished());
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+
+        release.notify_one();
+        let result = task.await.unwrap();
+        assert!(
+            result == Ok(())
+                || result == Err(LivePipelineError::Shutdown(LivePipelineStage::Write))
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

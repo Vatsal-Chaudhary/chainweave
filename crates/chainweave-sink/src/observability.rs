@@ -238,8 +238,7 @@ fn publish_metrics(snapshot: &StatusSnapshot) {
     gauge!("chainweave_live_ready").set(if snapshot.ready { 1.0 } else { 0.0 });
     gauge!("chainweave_live_lag_blocks").set(snapshot.current_lag_blocks as f64);
     gauge!("chainweave_live_reconnect_count").set(snapshot.reconnect_count as f64);
-    gauge!("chainweave_live_unreconciled_gap_count")
-        .set(snapshot.unreconciled_gap_count as f64);
+    gauge!("chainweave_live_unreconciled_gap_count").set(snapshot.unreconciled_gap_count as f64);
     gauge!("chainweave_live_verifier_disagreement_count")
         .set(snapshot.verifier_disagreement_count as f64);
     gauge!("chainweave_live_queue_depth", "queue" => "wakeups")

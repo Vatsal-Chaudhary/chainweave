@@ -232,13 +232,15 @@ pub fn redact_url(url: &Url) -> String {
             || current.contains("apikey")
             || current.contains("api-key")
         {
-            path_segments[index] = "redacted".to_owned();
+            "redacted".clone_into(&mut path_segments[index]);
         }
     }
     if !path_segments.is_empty()
         && let Ok(mut segments) = redacted.path_segments_mut()
     {
-        segments.clear().extend(path_segments.iter().map(String::as_str));
+        segments
+            .clear()
+            .extend(path_segments.iter().map(String::as_str));
     }
 
     let query_pairs = redacted
@@ -384,8 +386,7 @@ mod tests {
 
     #[test]
     fn redact_url_masks_keys_in_path_and_query() {
-        let path_key =
-            Url::parse("https://example.rpc/v3/super-secret-key?chain=sepolia").unwrap();
+        let path_key = Url::parse("https://example.rpc/v3/super-secret-key?chain=sepolia").unwrap();
         assert_eq!(
             redact_url(&path_key),
             "https://example.rpc/v3/redacted?chain=sepolia"
