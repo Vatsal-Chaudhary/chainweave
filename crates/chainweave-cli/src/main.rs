@@ -22,7 +22,7 @@ use url::Url;
 
 pub mod live_runtime;
 
-const DEFAULT_BACKFILL_WORKERS: usize = 128;
+const DEFAULT_BACKFILL_WORKERS: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(name = "chainweave", version, about = "Reorg-safe EVM chain indexer")]
@@ -69,6 +69,8 @@ enum Command {
         rpc_max_requests: Option<u64>,
         #[arg(long)]
         rpc_max_cost_units: Option<u64>,
+        #[arg(long, default_value_t = DEFAULT_BACKFILL_WORKERS, value_parser = parse_positive_usize)]
+        workers: usize,
     },
     /// Run live tip tracking from a durable checkpoint or an explicit start block.
     Live {
@@ -108,6 +110,7 @@ async fn main() -> Result<()> {
             rpc_timeout_ms,
             rpc_max_requests,
             rpc_max_cost_units,
+            workers,
         } => {
             let options = BackfillOptions {
                 from_block,
@@ -121,6 +124,7 @@ async fn main() -> Result<()> {
                 rpc_timeout: Duration::from_millis(rpc_timeout_ms),
                 rpc_max_requests,
                 rpc_max_cost_units,
+                workers,
             };
             run_backfill(&config, options).await
         }
@@ -160,6 +164,17 @@ struct BackfillOptions {
     rpc_timeout: Duration,
     rpc_max_requests: Option<u64>,
     rpc_max_cost_units: Option<u64>,
+    workers: usize,
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("must be nonzero".to_owned());
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone)]
@@ -326,7 +341,7 @@ async fn run_backfill(config: &AppConfig, options: BackfillOptions) -> Result<()
         captured_height = target_head.number,
         from_block = options.from_block,
         to_block = options.to_block,
-        workers = DEFAULT_BACKFILL_WORKERS,
+        workers = options.workers,
         initial_log_blocks = options.initial_log_blocks,
         min_log_blocks = options.min_log_blocks,
         max_log_blocks = options.max_log_blocks,
@@ -335,7 +350,7 @@ async fn run_backfill(config: &AppConfig, options: BackfillOptions) -> Result<()
 
     let started_at = Instant::now();
     let fetch_config = AdaptiveFetchConfig {
-        workers: DEFAULT_BACKFILL_WORKERS,
+        workers: options.workers,
         retry_policy,
         rpc_timeout: options.rpc_timeout,
         filter: contract_filter,
@@ -962,12 +977,15 @@ mod tests {
             "100",
             "--to-block",
             "200",
+            "--workers",
+            "4",
         ])
         .unwrap();
 
         let Command::Backfill {
             from_block,
             to_block,
+            workers,
             ..
         } = cli.command
         else {
@@ -975,6 +993,25 @@ mod tests {
         };
         assert_eq!(from_block, 100);
         assert_eq!(to_block, 200);
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn cli_rejects_zero_backfill_workers() {
+        let result = Cli::try_parse_from([
+            "chainweave",
+            "--rpc-url",
+            "http://127.0.0.1:8545",
+            "backfill",
+            "--from-block",
+            "100",
+            "--to-block",
+            "200",
+            "--workers",
+            "0",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
