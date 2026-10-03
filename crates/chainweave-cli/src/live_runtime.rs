@@ -6,8 +6,8 @@ use std::{
 
 use chainweave_core::{
     AppConfig, BackfillRange, BlockHash, BlockHeader, ChainBatch, ChainError, ConfigError,
-    FetchedRange, LiveConfig, LiveReport, LiveSink, LiveSource, LiveStartPoint, LiveTracker,
-    OrderedCommitCoordinator, RangeCommitSink, RetryPolicy, RpcBudget, RpcMethod,
+    FetchedRange, LiveConfig, LiveError, LiveReport, LiveSink, LiveSource, LiveStartPoint,
+    LiveTracker, OrderedCommitCoordinator, RangeCommitSink, RetryPolicy, RpcBudget, RpcMethod,
     ValidationProfile, VerifierStatus, redact_url,
 };
 use chainweave_rpc::{
@@ -232,7 +232,7 @@ impl RpcLiveSource {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RpcReconciliationSource {
     primary: RpcLiveSource,
     verifier: Option<RpcLiveSource>,
@@ -280,57 +280,75 @@ pub struct PostgresLiveStore {
     writer: PostgresChainWriter,
 }
 
-struct BlockingTrackerSource<'a> {
-    source: &'a mut RpcReconciliationSource,
+struct BlockingTrackerSource {
+    source: RpcReconciliationSource,
     handle: tokio::runtime::Handle,
+    shutdown: CancellationToken,
 }
 
-impl<'a> BlockingTrackerSource<'a> {
-    fn new(source: &'a mut RpcReconciliationSource) -> Self {
+impl BlockingTrackerSource {
+    fn new(
+        source: RpcReconciliationSource,
+        handle: tokio::runtime::Handle,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             source,
-            handle: tokio::runtime::Handle::current(),
+            handle,
+            shutdown,
         }
     }
 
-    fn block_on<T>(
-        handle: &tokio::runtime::Handle,
-        future: impl std::future::Future<Output = Result<T, LiveRuntimeError>>,
-    ) -> Result<T, String> {
-        handle.block_on(future).map_err(|error| error.to_string())
+    fn into_inner(self) -> RpcReconciliationSource {
+        self.source
     }
 }
 
-impl LiveSource for BlockingTrackerSource<'_> {
+impl LiveSource for BlockingTrackerSource {
     type Block = IndexedBlock;
     type Error = String;
 
     fn current_head(&mut self) -> Result<BlockHeader, Self::Error> {
         let handle = self.handle.clone();
-        let header = Self::block_on(&handle, self.source.primary.poll_head())?;
+        let shutdown = self.shutdown.clone();
+        let header = block_on_with_shutdown(&handle, shutdown, self.source.primary.poll_head())?;
         self.source.last_head = Some(header);
-        Self::block_on(&handle, self.source.verify_head(header))?;
+        let shutdown = self.shutdown.clone();
+        block_on_with_shutdown(&handle, shutdown, self.source.verify_head(header))?;
         Ok(header)
     }
 
     fn block_by_number(&mut self, height: u64) -> Result<Self::Block, Self::Error> {
         let handle = self.handle.clone();
-        Self::block_on(&handle, self.source.primary.block_by_number(height))
+        let shutdown = self.shutdown.clone();
+        block_on_with_shutdown(
+            &handle,
+            shutdown,
+            self.source.primary.block_by_number(height),
+        )
     }
 
     fn block_by_hash(&mut self, hash: BlockHash) -> Result<Self::Block, Self::Error> {
         let handle = self.handle.clone();
-        Self::block_on(&handle, self.source.primary.block_by_hash(hash))
+        let shutdown = self.shutdown.clone();
+        block_on_with_shutdown(&handle, shutdown, self.source.primary.block_by_hash(hash))
     }
 
     fn header_by_number(&mut self, height: u64) -> Result<Option<BlockHeader>, Self::Error> {
         let handle = self.handle.clone();
-        Self::block_on(&handle, self.source.primary.header_by_number(height)).map(Some)
+        let shutdown = self.shutdown.clone();
+        block_on_with_shutdown(
+            &handle,
+            shutdown,
+            self.source.primary.header_by_number(height),
+        )
+        .map(Some)
     }
 
     fn header_by_hash(&mut self, hash: BlockHash) -> Result<Option<BlockHeader>, Self::Error> {
         let handle = self.handle.clone();
-        Self::block_on(&handle, self.source.primary.header_by_hash(hash))
+        let shutdown = self.shutdown.clone();
+        block_on_with_shutdown(&handle, shutdown, self.source.primary.header_by_hash(hash))
     }
 
     fn block_header(block: &Self::Block) -> BlockHeader {
@@ -350,7 +368,8 @@ impl LiveSource for BlockingTrackerSource<'_> {
             return Ok(VerifierStatus::Unavailable);
         };
         let handle = self.handle.clone();
-        match Self::block_on(&handle, verifier.header_by_number(height)) {
+        let shutdown = self.shutdown.clone();
+        match block_on_with_shutdown(&handle, shutdown, verifier.header_by_number(height)) {
             Ok(verifier) if verifier.hash == hash => Ok(VerifierStatus::Match),
             Ok(_) => {
                 self.source.verifier_disagreements =
@@ -365,14 +384,21 @@ impl LiveSource for BlockingTrackerSource<'_> {
 struct BlockingPostgresLiveSink {
     store: PostgresLiveStore,
     handle: tokio::runtime::Handle,
+    shutdown: CancellationToken,
     parent_anchor: Option<BlockHeader>,
 }
 
 impl BlockingPostgresLiveSink {
-    fn new(store: PostgresLiveStore, parent_anchor: Option<BlockHeader>) -> Self {
+    fn new(
+        store: PostgresLiveStore,
+        handle: tokio::runtime::Handle,
+        shutdown: CancellationToken,
+        parent_anchor: Option<BlockHeader>,
+    ) -> Self {
         Self {
             store,
-            handle: tokio::runtime::Handle::current(),
+            handle,
+            shutdown,
             parent_anchor,
         }
     }
@@ -381,10 +407,29 @@ impl BlockingPostgresLiveSink {
         &self,
         future: impl std::future::Future<Output = Result<T, LiveRuntimeError>>,
     ) -> Result<T, String> {
-        self.handle
-            .block_on(future)
-            .map_err(|error| error.to_string())
+        block_on_with_shutdown(&self.handle, self.shutdown.clone(), future)
     }
+}
+
+fn block_on_with_shutdown<T>(
+    handle: &tokio::runtime::Handle,
+    shutdown: CancellationToken,
+    future: impl std::future::Future<Output = Result<T, LiveRuntimeError>>,
+) -> Result<T, String> {
+    block_on_runtime_with_shutdown(handle, shutdown, future).map_err(|error| error.to_string())
+}
+
+fn block_on_runtime_with_shutdown<T>(
+    handle: &tokio::runtime::Handle,
+    shutdown: CancellationToken,
+    future: impl std::future::Future<Output = Result<T, LiveRuntimeError>>,
+) -> Result<T, LiveRuntimeError> {
+    handle.block_on(async move {
+        tokio::select! {
+            () = shutdown.cancelled() => Err(LiveRuntimeError::Task(LiveTaskError::TaskCancelled(LiveTask::Tracker))),
+            result = future => result,
+        }
+    })
 }
 
 impl RangeCommitSink<IndexedBlock> for BlockingPostgresLiveSink {
@@ -686,6 +731,7 @@ async fn tracker_task(
         &health,
         &context,
         &wakeup_rx,
+        &shutdown,
         None,
     )
     .await
@@ -721,6 +767,7 @@ async fn tracker_task(
                     &health,
                     &context,
                     &wakeup_rx,
+                    &shutdown,
                     None,
                 )
                 .await
@@ -742,6 +789,20 @@ fn live_runtime_error_to_task(error: LiveRuntimeError) -> LiveTaskError {
     }
 }
 
+fn live_tracker_error_to_runtime(error: LiveError) -> LiveRuntimeError {
+    match error {
+        LiveError::Cancelled => {
+            LiveRuntimeError::Task(LiveTaskError::TaskCancelled(LiveTask::Tracker))
+        }
+        LiveError::Chain(error) => LiveRuntimeError::Task(LiveTaskError::Chain(error)),
+        LiveError::Source(error) => LiveRuntimeError::Task(LiveTaskError::RpcTransient(error)),
+        LiveError::Sink(error) => LiveRuntimeError::Task(LiveTaskError::DatabaseTransient(error)),
+        LiveError::Backfill(error) => {
+            LiveRuntimeError::Task(LiveTaskError::DatabaseTransient(error.to_string()))
+        }
+    }
+}
+
 async fn reconcile_and_publish(
     writer: &PostgresChainWriter,
     source: &mut RpcReconciliationSource,
@@ -751,10 +812,11 @@ async fn reconcile_and_publish(
     health: &HealthState,
     context: &StatusContext,
     wakeup_rx: &mpsc::Receiver<()>,
+    shutdown: &CancellationToken,
     unreconciled_gap_count: Option<u64>,
 ) -> Result<(), LiveRuntimeError> {
     reconnect.record_subscribed_for_wakeups();
-    let report = reconcile_once(writer, source, options, max_reorg_depth).await?;
+    let report = reconcile_once(writer, source, options, max_reorg_depth, shutdown).await?;
     reconnect.record_reconciled_to_head()?;
     reconnect.record_ready_after_reconnect_at(Instant::now())?;
     let gap_count = unreconciled_gap_count.unwrap_or_else(|| {
@@ -778,6 +840,7 @@ async fn reconcile_once(
     source: &mut RpcReconciliationSource,
     options: &LiveCommandOptions,
     max_reorg_depth: u64,
+    shutdown: &CancellationToken,
 ) -> Result<LiveReport, LiveRuntimeError> {
     let checkpoint = PostgresLiveStore::new(writer.clone())
         .checkpoint_header()
@@ -798,15 +861,35 @@ async fn reconcile_once(
     };
     let tracker = LiveTracker::new(live_config);
     let store = PostgresLiveStore::new(writer.clone());
-    tokio::task::block_in_place(move || {
-        let mut tracker_source = BlockingTrackerSource::new(source);
-        let mut tracker_sink = BlockingPostgresLiveSink::new(store, checkpoint);
-        tracker
-            .run(&mut tracker_source, &mut tracker_sink, std::iter::empty())
-            .map_err(|error| {
-                LiveRuntimeError::Task(LiveTaskError::DatabaseTransient(error.to_string()))
-            })
+    let source_owned = source.clone();
+    let handle = tokio::runtime::Handle::current();
+    let shutdown_for_blocking = shutdown.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut tracker_source =
+            BlockingTrackerSource::new(source_owned, handle.clone(), shutdown_for_blocking.clone());
+        let mut tracker_sink =
+            BlockingPostgresLiveSink::new(store, handle, shutdown_for_blocking.clone(), checkpoint);
+        let result = tracker
+            .run_with_cancellation(
+                &mut tracker_source,
+                &mut tracker_sink,
+                std::iter::empty(),
+                || shutdown_for_blocking.is_cancelled(),
+            )
+            .map_err(live_tracker_error_to_runtime);
+        (result, tracker_source.into_inner())
     })
+    .await
+    .map_err(|error| {
+        if error.is_panic() {
+            LiveRuntimeError::Task(LiveTaskError::TaskPanicked(LiveTask::Tracker))
+        } else {
+            LiveRuntimeError::Task(LiveTaskError::TaskCancelled(LiveTask::Tracker))
+        }
+    })?;
+    let (result, source_after) = joined;
+    *source = source_after;
+    result
 }
 
 async fn publish_status(
@@ -1452,6 +1535,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
+        sync::Notify,
     };
 
     #[test]
@@ -1706,9 +1790,10 @@ mod tests {
                 Some("wss://verify.example/mainnet?api_key=redacted"),
             ))
             .await;
-        let server = ObservabilityServer::bind("127.0.0.1:0".parse().unwrap(), health)
-            .await
-            .unwrap();
+        let server =
+            ObservabilityServer::bind_with_local_recorder("127.0.0.1:0".parse().unwrap(), health)
+                .await
+                .unwrap();
         let address = server.local_addr().unwrap();
         let server_task = tokio::spawn(server.serve());
 
@@ -1735,6 +1820,96 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_and_wakeup_tasks_stay_responsive_while_tracker_blocks_on_slow_fake_rpc() {
+        let shutdown = CancellationToken::new();
+        let started = Arc::new(Notify::new());
+        let tracker =
+            spawn_slow_fake_rpc_on_blocking_tracker_thread(shutdown.clone(), Arc::clone(&started));
+        started.notified().await;
+
+        let health = HealthState::default();
+        health
+            .update_live_status(initial_status("http://127.0.0.1:8545", None))
+            .await;
+        let server =
+            ObservabilityServer::bind_with_local_recorder("127.0.0.1:0".parse().unwrap(), health)
+                .await
+                .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let (wakeups, mut wakeup_rx) = new_head_wakeup_channel();
+        let wakeup_shutdown = shutdown.clone();
+        let wakeup_task = tokio::spawn(poll_wakeup_task(
+            Duration::from_millis(5),
+            wakeups,
+            wakeup_shutdown,
+        ));
+
+        let health_body =
+            tokio::time::timeout(Duration::from_millis(100), http_get(address, "/health"))
+                .await
+                .unwrap();
+        let wakeup = tokio::time::timeout(Duration::from_millis(100), wakeup_rx.recv())
+            .await
+            .unwrap();
+
+        assert!(health_body.contains("\"status\""));
+        assert_eq!(wakeup, Some(()));
+        assert!(!tracker.is_finished());
+
+        shutdown.cancel();
+        server_task.abort();
+        let _ = wakeup_task.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), tracker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(LiveRuntimeError::Task(LiveTaskError::TaskCancelled(
+                LiveTask::Tracker
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_slow_fake_rpc_completes_within_shutdown_timeout() {
+        let shutdown = CancellationToken::new();
+        let started = Arc::new(Notify::new());
+        let tracker =
+            spawn_slow_fake_rpc_on_blocking_tracker_thread(shutdown.clone(), Arc::clone(&started));
+        started.notified().await;
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(100), tracker)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            Err(LiveRuntimeError::Task(LiveTaskError::TaskCancelled(
+                LiveTask::Tracker
+            )))
+        ));
+    }
+
+    fn spawn_slow_fake_rpc_on_blocking_tracker_thread(
+        shutdown: CancellationToken,
+        started: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<Result<(), LiveRuntimeError>> {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            block_on_runtime_with_shutdown(&handle, shutdown, async move {
+                started.notify_one();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+        })
     }
 
     #[test]

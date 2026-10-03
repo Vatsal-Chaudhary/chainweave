@@ -138,6 +138,8 @@ pub enum LiveError {
     Source(String),
     #[error("{0}")]
     Sink(String),
+    #[error("live tracker cancelled")]
+    Cancelled,
     #[error(transparent)]
     Chain(#[from] ChainError),
     #[error(transparent)]
@@ -167,6 +169,23 @@ impl LiveTracker {
         K::Error: std::fmt::Display,
         BackfillError: From<K::Error>,
     {
+        self.run_with_cancellation(source, sink, events, || false)
+    }
+
+    pub fn run_with_cancellation<S, K, C>(
+        &self,
+        source: &mut S,
+        sink: &mut K,
+        events: impl IntoIterator<Item = LiveHeadEvent>,
+        is_cancelled: C,
+    ) -> Result<LiveReport, LiveError>
+    where
+        S: LiveSource,
+        K: LiveSink<S::Block>,
+        K::Error: std::fmt::Display,
+        BackfillError: From<K::Error>,
+        C: Fn() -> bool,
+    {
         let mut report = LiveReport::new(sink.checkpoint());
         for event in events {
             match event {
@@ -176,6 +195,7 @@ impl LiveTracker {
             }
         }
 
+        ensure_not_cancelled(&is_cancelled)?;
         let mut budget = WindowBudget::new(self.config)?;
         budget.record(RpcMethod::GetBlockByNumber, &mut report)?;
         let head = source
@@ -200,7 +220,7 @@ impl LiveTracker {
                     LiveHaltReason::MissingExplicitStart,
                 ));
             }
-            self.catch_up_from_start(source, sink, head, &mut budget, &mut report)?;
+            self.catch_up_from_start(source, sink, head, &mut budget, &mut report, &is_cancelled)?;
             report.final_checkpoint = sink.checkpoint();
             mark_ready_if_healthy(&mut report);
             return Ok(report);
@@ -219,7 +239,7 @@ impl LiveTracker {
                 report.transition(LiveReadiness::Degraded);
                 return Ok(report);
             }
-            self.apply_chain_state(source, sink, head, &mut budget, &mut report)?;
+            self.apply_chain_state(source, sink, head, &mut budget, &mut report, &is_cancelled)?;
             report.final_checkpoint = sink.checkpoint();
             mark_ready_if_healthy(&mut report);
             return Ok(report);
@@ -227,14 +247,29 @@ impl LiveTracker {
 
         if head.height == checkpoint.height {
             if head.hash != checkpoint.hash {
-                self.apply_chain_state(source, sink, head, &mut budget, &mut report)?;
+                self.apply_chain_state(
+                    source,
+                    sink,
+                    head,
+                    &mut budget,
+                    &mut report,
+                    &is_cancelled,
+                )?;
             }
             report.final_checkpoint = sink.checkpoint();
             mark_ready_if_healthy(&mut report);
             return Ok(report);
         }
 
-        self.catch_up_from_checkpoint(source, sink, checkpoint, head, &mut budget, &mut report)?;
+        self.catch_up_from_checkpoint(
+            source,
+            sink,
+            checkpoint,
+            head,
+            &mut budget,
+            &mut report,
+            &is_cancelled,
+        )?;
         report.final_checkpoint = sink.checkpoint();
         mark_ready_if_healthy(&mut report);
         Ok(report)
@@ -247,6 +282,7 @@ impl LiveTracker {
         head: BlockHeader,
         budget: &mut WindowBudget,
         report: &mut LiveReport,
+        is_cancelled: &impl Fn() -> bool,
     ) -> Result<(), LiveError>
     where
         S: LiveSource,
@@ -257,6 +293,7 @@ impl LiveTracker {
         let from = self.config.explicit_start.unwrap_or(0);
         let mut coordinator = OrderedCommitCoordinator::new(from, head.height, None)?;
         for height in from..=head.height {
+            ensure_not_cancelled(is_cancelled)?;
             self.fetch_and_push_height(source, sink, &mut coordinator, height, budget, report)?;
         }
         Ok(())
@@ -270,6 +307,7 @@ impl LiveTracker {
         head: BlockHeader,
         budget: &mut WindowBudget,
         report: &mut LiveReport,
+        is_cancelled: &impl Fn() -> bool,
     ) -> Result<(), LiveError>
     where
         S: LiveSource,
@@ -280,12 +318,13 @@ impl LiveTracker {
         let start = checkpoint.height + 1;
         let mut coordinator = OrderedCommitCoordinator::new(start, head.height, Some(checkpoint))?;
         for height in start..=head.height {
+            ensure_not_cancelled(is_cancelled)?;
             match self.fetch_and_push_height(source, sink, &mut coordinator, height, budget, report)
             {
                 Ok(()) => {}
                 Err(LiveError::Backfill(BackfillError::FetchedSuffixInvalidated { .. })) => {
                     report.apply_order.clear();
-                    self.apply_chain_state(source, sink, head, budget, report)?;
+                    self.apply_chain_state(source, sink, head, budget, report, is_cancelled)?;
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -335,6 +374,7 @@ impl LiveTracker {
         head: BlockHeader,
         budget: &mut WindowBudget,
         report: &mut LiveReport,
+        is_cancelled: &impl Fn() -> bool,
     ) -> Result<(), LiveError>
     where
         S: LiveSource,
@@ -369,6 +409,7 @@ impl LiveTracker {
 
         let mut apply_blocks = Vec::new();
         for event in &batch.events {
+            ensure_not_cancelled(is_cancelled)?;
             match event {
                 ChainEvent::Rollback(header) => report.rollback_order.push(header.height),
                 ChainEvent::Apply(header) => {
@@ -456,6 +497,13 @@ fn mark_ready_if_healthy(report: &mut LiveReport) {
     if report.halted.is_none() && report.verifier_disagreements == 0 {
         report.transition(LiveReadiness::Ready);
     }
+}
+
+fn ensure_not_cancelled(is_cancelled: &impl Fn() -> bool) -> Result<(), LiveError> {
+    if is_cancelled() {
+        return Err(LiveError::Cancelled);
+    }
+    Ok(())
 }
 
 struct LiveResolver<'a, S, K, B> {

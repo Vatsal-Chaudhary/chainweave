@@ -177,6 +177,27 @@ impl ObservabilityServer {
         Ok(Self { listener, router })
     }
 
+    /// Binds an observability listener backed by a local metrics recorder handle.
+    ///
+    /// This is useful for tests and embedded callers that cannot install the process-global
+    /// metrics recorder more than once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be bound.
+    pub async fn bind_with_local_recorder(
+        address: SocketAddr,
+        health: HealthState,
+    ) -> Result<Self, ObservabilityError> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let router = router(health, metrics);
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|source| ObservabilityError::Bind { address, source })?;
+        Ok(Self { listener, router })
+    }
+
     /// Returns the bound listener address.
     ///
     /// # Errors
