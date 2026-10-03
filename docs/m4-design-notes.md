@@ -104,7 +104,7 @@ M4 production live tracking ships as sequential reconciliation:
 - proven tip reorgs still commit as one durable writer transaction;
 - RPC and Postgres calls provide natural backpressure because the next height is not fetched until the current height is validated and committed or rolled back.
 
-There are no production fetch, coordinate, raw-pass-through, decode, or write stage queues in M4. Stage queues can be revisited only with an FDD update and a production path that exercises the same code as the tests. The wakeup channel may coalesce because periodic/reconnect reconciliation heals missed heads.
+M4 has no production staged fetch, coordination, decode, or write channels. A staged architecture can be revisited only with an FDD update and a production path that exercises the same code as the tests. The wakeup channel may coalesce because periodic/reconnect reconciliation heals missed heads.
 
 Supervision policy: if any runtime task exits before shutdown, even successfully, cancel the live runner and treat the early exit as a failure. Correctness errors stop writes. Transient RPC/WS failures reconcile again from the durable checkpoint with backoff. The writer is the only component allowed to mutate canonical state.
 
