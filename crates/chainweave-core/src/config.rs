@@ -14,7 +14,6 @@ const ENV_PREFIX: &str = "CHAINWEAVE_";
 pub struct AppConfig {
     pub rpc: RpcConfig,
     pub indexer: IndexerConfig,
-    pub queues: QueueConfig,
     pub server: ServerConfig,
     pub database_url: Option<String>,
     pub kafka_brokers: Option<Vec<String>>,
@@ -33,14 +32,6 @@ pub struct IndexerConfig {
     pub max_reorg_depth: u64,
     pub safe_depth: Option<u64>,
     pub finalized_depth: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct QueueConfig {
-    pub fetch: usize,
-    pub coordinate: usize,
-    pub decode: usize,
-    pub write: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,12 +77,6 @@ impl Default for AppConfig {
                 max_reorg_depth: 2_048,
                 safe_depth: None,
                 finalized_depth: None,
-            },
-            queues: QueueConfig {
-                fetch: 128,
-                coordinate: 64,
-                decode: 128,
-                write: 64,
             },
             server: ServerConfig {
                 listen_addr: "127.0.0.1:9100".parse().expect("default address is valid"),
@@ -153,17 +138,6 @@ impl AppConfig {
             return Err(invalid(
                 "indexer.safe_depth must not exceed indexer.finalized_depth",
             ));
-        }
-
-        for (name, capacity) in [
-            ("queues.fetch", self.queues.fetch),
-            ("queues.coordinate", self.queues.coordinate),
-            ("queues.decode", self.queues.decode),
-            ("queues.write", self.queues.write),
-        ] {
-            if capacity == 0 {
-                return Err(invalid(format!("{name} must be nonzero")));
-            }
         }
 
         if let Some(identity) = &self.expected_chain {
@@ -333,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_depth_relationships_and_queue_capacity() {
+    fn rejects_invalid_depth_relationships() {
         let mut config = AppConfig::default();
         config.indexer.max_reorg_depth = 100;
         assert!(config.validate(ValidationProfile::Head).is_err());
@@ -344,8 +318,7 @@ mod tests {
         assert!(config.validate(ValidationProfile::Head).is_err());
 
         config.indexer.safe_depth = Some(12);
-        config.queues.write = 0;
-        assert!(config.validate(ValidationProfile::Head).is_err());
+        config.validate(ValidationProfile::Head).unwrap();
     }
 
     #[test]

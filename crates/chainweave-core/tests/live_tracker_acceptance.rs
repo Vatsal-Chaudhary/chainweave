@@ -70,7 +70,6 @@ struct LiveTestConfig {
     max_reorg_depth: u64,
     live_budget_cost_units_per_minute: u64,
     poll_interval_seconds: u64,
-    queue_capacity: usize,
     explicit_start: Option<u64>,
     finalized_height: Option<u64>,
     clock: FakeClock,
@@ -103,12 +102,12 @@ enum LiveFault {
     RateLimitOnce(RpcMethod),
     ExhaustLiveBudget,
     StallWriter,
-    StagePanic(&'static str),
+    TaskPanic(&'static str),
     CrashBeforeCommit,
     CrashAfterCommit,
     ProviderDisagreement { height: u64 },
     FinalizedBoundary { finalized_height: u64 },
-    ShutdownWithFullChannel,
+    ShutdownDuringSequentialWork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,16 +467,13 @@ fn writer_backpressure_blocks_upstream_without_dropping_data() {
     let chain = linear_blocks(&[120, 121, 122, 123]);
     let scenario = scenario_with_config(
         "writer backpressure",
-        "bounded writer saturation applies backpressure and preserves every queued block",
+        "sequential writer backpressure preserves every pending block",
         Some(block(&chain, 120).header),
         chain.clone(),
         BTreeMap::new(),
         vec![HeadEvent::Notify(block(&chain, 123).header)],
         vec![LiveFault::StallWriter],
-        LiveTestConfig {
-            queue_capacity: 1,
-            ..LiveTestConfig::default()
-        },
+        LiveTestConfig::default(),
     );
 
     expect_live_outcome(
@@ -487,15 +483,15 @@ fn writer_backpressure_blocks_upstream_without_dropping_data() {
 }
 
 #[test]
-fn stage_panic_cancels_pipeline_and_recovers_from_checkpoint() {
+fn task_panic_cancels_runner_and_recovers_from_checkpoint() {
     let chain = linear_blocks(&[130, 131, 132]);
     let scenario = scenario(
-        "stage panic",
-        "supervision cancels a panicked stage and restart reconciles from the durable checkpoint",
+        "task panic",
+        "supervision cancels a panicked task and restart reconciles from the durable checkpoint",
         Some(block(&chain, 130).header),
         chain.clone(),
         vec![HeadEvent::Notify(block(&chain, 132).header)],
-        vec![LiveFault::StagePanic("coordinate")],
+        vec![LiveFault::TaskPanic("tracker")],
     );
 
     expect_live_outcome(
@@ -646,20 +642,17 @@ fn reorg_crossing_finalized_boundary_halts_without_writes() {
 }
 
 #[test]
-fn shutdown_cancellation_with_full_channel_completes_without_hanging() {
+fn shutdown_cancellation_during_sequential_work_completes_without_hanging() {
     let chain = linear_blocks(&[200, 201, 202, 203]);
     let scenario = scenario_with_config(
-        "shutdown full channel",
-        "shutdown cancellation with a full bounded channel does not hang and preserves committed order",
+        "shutdown sequential work",
+        "shutdown cancellation during sequential work does not hang and preserves committed order",
         Some(block(&chain, 200).header),
         chain.clone(),
         BTreeMap::new(),
         vec![HeadEvent::Notify(block(&chain, 203).header)],
-        vec![LiveFault::ShutdownWithFullChannel],
-        LiveTestConfig {
-            queue_capacity: 1,
-            ..LiveTestConfig::default()
-        },
+        vec![LiveFault::ShutdownDuringSequentialWork],
+        LiveTestConfig::default(),
     );
 
     expect_live_outcome(
@@ -1000,7 +993,6 @@ fn live_config(config: &LiveTestConfig) -> LiveConfig {
         max_reorg_depth: config.max_reorg_depth,
         live_budget_cost_units_per_minute: config.live_budget_cost_units_per_minute,
         poll_interval: Duration::from_secs(config.poll_interval_seconds),
-        queue_capacity: config.queue_capacity,
         explicit_start: config.explicit_start,
         finalized_height: config.finalized_height,
         budget_window: Duration::from_secs(config.clock.window_seconds),
@@ -1064,7 +1056,7 @@ fn outcome_from_report(
         apply_order: report.apply_order,
         readiness: readiness(report.readiness),
         unreconciled_gaps: 0,
-        panics: if has_stage_panic(scenario) {
+        panics: if has_task_panic(scenario) {
             1
         } else {
             report.panics
@@ -1091,7 +1083,7 @@ fn outcome_from_report(
         shutdown_completed: has_shutdown_with_full_channel(scenario) || report.shutdown_completed,
         halted: report.halted.map(halt_reason),
     };
-    if has_stage_panic(scenario) {
+    if has_task_panic(scenario) {
         outcome.partial_commits_before_recovery = 0;
     }
     outcome
@@ -1139,11 +1131,11 @@ fn should_record_canonical_heights(scenario: &LiveScenario) -> bool {
     )
 }
 
-fn has_stage_panic(scenario: &LiveScenario) -> bool {
+fn has_task_panic(scenario: &LiveScenario) -> bool {
     scenario
         .faults
         .iter()
-        .any(|fault| matches!(fault, LiveFault::StagePanic(_)))
+        .any(|fault| matches!(fault, LiveFault::TaskPanic(_)))
 }
 
 fn has_reorg_during_catch_up(scenario: &LiveScenario) -> bool {
@@ -1157,7 +1149,7 @@ fn has_shutdown_with_full_channel(scenario: &LiveScenario) -> bool {
     scenario
         .faults
         .iter()
-        .any(|fault| matches!(fault, LiveFault::ShutdownWithFullChannel))
+        .any(|fault| matches!(fault, LiveFault::ShutdownDuringSequentialWork))
 }
 
 fn consume_scenario(scenario: &LiveScenario) -> usize {
@@ -1168,7 +1160,6 @@ fn consume_scenario(scenario: &LiveScenario) -> usize {
         + scenario.rpc.verifier.len()
         + scenario.heads.events.len()
         + scenario.faults.len()
-        + scenario.config.queue_capacity
         + scenario.config.max_reorg_depth as usize
         + scenario.config.live_budget_cost_units_per_minute as usize
         + scenario.config.poll_interval_seconds as usize
@@ -1224,12 +1215,12 @@ fn consume_scenario(scenario: &LiveScenario) -> usize {
             LiveFault::TimeoutOnce(method) | LiveFault::RateLimitOnce(method) => {
                 method.default_cost() as usize
             }
-            LiveFault::StagePanic(stage) => stage.len(),
+            LiveFault::TaskPanic(task) => task.len(),
             LiveFault::ExhaustLiveBudget
             | LiveFault::StallWriter
             | LiveFault::CrashBeforeCommit
             | LiveFault::CrashAfterCommit
-            | LiveFault::ShutdownWithFullChannel => 1,
+            | LiveFault::ShutdownDuringSequentialWork => 1,
         });
     }
     touched
@@ -1369,7 +1360,6 @@ impl Default for LiveTestConfig {
             max_reorg_depth: 2_048,
             live_budget_cost_units_per_minute: 1_200,
             poll_interval_seconds: 12,
-            queue_capacity: 4,
             explicit_start: Some(0),
             finalized_height: None,
             clock: FakeClock {

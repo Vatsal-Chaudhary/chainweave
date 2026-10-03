@@ -22,6 +22,8 @@ use url::Url;
 
 pub mod live_runtime;
 
+const DEFAULT_BACKFILL_WORKERS: usize = 128;
+
 #[derive(Debug, Parser)]
 #[command(name = "chainweave", version, about = "Reorg-safe EVM chain indexer")]
 struct Cli {
@@ -324,7 +326,7 @@ async fn run_backfill(config: &AppConfig, options: BackfillOptions) -> Result<()
         captured_height = target_head.number,
         from_block = options.from_block,
         to_block = options.to_block,
-        workers = config.queues.fetch,
+        workers = DEFAULT_BACKFILL_WORKERS,
         initial_log_blocks = options.initial_log_blocks,
         min_log_blocks = options.min_log_blocks,
         max_log_blocks = options.max_log_blocks,
@@ -333,7 +335,7 @@ async fn run_backfill(config: &AppConfig, options: BackfillOptions) -> Result<()
 
     let started_at = Instant::now();
     let fetch_config = AdaptiveFetchConfig {
-        workers: config.queues.fetch,
+        workers: DEFAULT_BACKFILL_WORKERS,
         retry_policy,
         rpc_timeout: options.rpc_timeout,
         filter: contract_filter,

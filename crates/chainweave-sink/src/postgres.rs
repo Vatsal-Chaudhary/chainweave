@@ -1606,7 +1606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_pipeline_restart_rebuilds_from_durable_checkpoint_after_precommit_kill() {
+    async fn live_runner_restart_rebuilds_from_durable_checkpoint_after_precommit_kill() {
         let Some(clean_db) = TestDb::create().await else {
             return;
         };
@@ -1634,7 +1634,7 @@ mod tests {
             .unwrap();
         let seed_state = durable_state_snapshot(&db.writer).await;
 
-        run_crash_child(&db, "live_pipeline_before_commit").await;
+        run_crash_child(&db, "live_runner_before_commit").await;
         assert_eq!(durable_state_snapshot(&db.writer).await, seed_state);
 
         commit_live_height_from_durable_checkpoint(&db.writer, 1).await;
@@ -1714,7 +1714,7 @@ mod tests {
         let crash_point = match mode.as_str() {
             "before_commit" => CrashPoint::BeforeCommit,
             "after_commit" => CrashPoint::AfterCommit,
-            "live_pipeline_before_commit" => {
+            "live_runner_before_commit" => {
                 commit_live_height_from_durable_checkpoint_with_crash(
                     &writer,
                     1,

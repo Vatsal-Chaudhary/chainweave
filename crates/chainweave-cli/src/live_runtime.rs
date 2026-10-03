@@ -11,7 +11,7 @@ use chainweave_core::{
     ValidationProfile, VerifierStatus, redact_url,
 };
 use chainweave_rpc::{
-    ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
+    ContractLogFilter, NewHeadWakeupSender, RpcClient, RpcError, capture_target_head_with_retry,
     fetch_header_by_hash_with_retry, fetch_header_by_number_with_retry, new_head_wakeup_channel,
     retry_rpc_request, spawn_new_heads_wakeup,
 };
@@ -51,7 +51,7 @@ pub enum LiveRuntimeError {
     #[error("invalid reconnect order: {0}")]
     ReconnectOrder(String),
     #[error(transparent)]
-    Pipeline(#[from] LivePipelineError),
+    Task(#[from] LiveTaskError),
 }
 
 #[derive(Debug, Clone)]
@@ -483,7 +483,11 @@ pub async fn run_live(
         .map_err(ObservabilityError::Serve)?;
     let shutdown = CancellationToken::new();
     spawn_shutdown_signal(shutdown.clone());
-    let observability_task = tokio::spawn(observability.serve());
+    let mut supervisor = LiveTaskSupervisor::new(shutdown.clone());
+    supervisor.spawn(
+        LiveTask::HealthServer,
+        health_server_task(observability, shutdown.clone()),
+    );
 
     info!(
         primary_rpc = %primary_redacted,
@@ -539,39 +543,153 @@ pub async fn run_live(
         Duration::from_millis(500),
         Duration::from_secs(30),
     )?;
-    let mut reconnect = ReconnectLoop::new(policy);
-    let (wakeups, mut wakeup_rx) = new_head_wakeup_channel();
-    let mut new_heads_task = if is_ws_url(&config.rpc.primary_url) {
-        reconnect.record_subscribed_for_wakeups();
-        Some(spawn_new_heads_wakeup(
-            config.rpc.primary_url.clone(),
-            wakeups.clone(),
-        ))
-    } else {
-        reconnect.record_subscribed_for_wakeups();
-        None
-    };
+    let reconnect = ReconnectLoop::new(policy);
+    let (wakeups, wakeup_rx) = new_head_wakeup_channel();
+    if is_ws_url(&config.rpc.primary_url) {
+        supervisor.spawn(
+            LiveTask::Wakeups,
+            websocket_wakeup_task(
+                config.rpc.primary_url.clone(),
+                wakeups.clone(),
+                shutdown.clone(),
+            ),
+        );
+    }
 
     let primary_source = RpcLiveSource::new(primary_client, runtime_config.clone())?;
     let verifier_source = verifier_client
         .map(|client| RpcLiveSource::new(client, runtime_config.clone()))
         .transpose()?;
-    let mut source = RpcReconciliationSource::new(primary_source, verifier_source);
-    let mut poll = tokio::time::interval(options.poll_interval);
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let source = RpcReconciliationSource::new(primary_source, verifier_source);
+    let context = StatusContext::new(&primary_redacted, verifier_redacted.as_deref());
+    supervisor.spawn(
+        LiveTask::Poll,
+        poll_wakeup_task(options.poll_interval, wakeups.clone(), shutdown.clone()),
+    );
+    supervisor.spawn(
+        LiveTask::Tracker,
+        tracker_task(
+            writer,
+            source,
+            options.clone(),
+            config.indexer.max_reorg_depth,
+            reconnect,
+            health,
+            context,
+            wakeup_rx,
+            shutdown.clone(),
+        ),
+    );
 
+    match tokio::time::timeout(options.shutdown_timeout, supervisor.run_until_first_exit()).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(LiveRuntimeError::Task(LiveTaskError::SupervisorCancelled)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StatusContext {
+    primary_rpc_url: String,
+    verifier_rpc_url: Option<String>,
+}
+
+impl StatusContext {
+    fn new(primary_rpc_url: &str, verifier_rpc_url: Option<&str>) -> Self {
+        Self {
+            primary_rpc_url: primary_rpc_url.to_owned(),
+            verifier_rpc_url: verifier_rpc_url.map(ToOwned::to_owned),
+        }
+    }
+}
+
+async fn health_server_task(
+    observability: ObservabilityServer,
+    shutdown: CancellationToken,
+) -> Result<(), LiveTaskError> {
+    tokio::select! {
+        () = shutdown.cancelled() => Ok(()),
+        result = observability.serve() => {
+            result.map_err(|error| LiveTaskError::TaskFailed(LiveTask::HealthServer, error.to_string()))
+        }
+    }
+}
+
+async fn websocket_wakeup_task(
+    ws_url: Url,
+    wakeups: NewHeadWakeupSender,
+    shutdown: CancellationToken,
+) -> Result<(), LiveTaskError> {
+    loop {
+        let mut task = spawn_new_heads_wakeup(ws_url.clone(), wakeups.clone());
+        tokio::select! {
+            () = shutdown.cancelled() => {
+                task.abort();
+                let _ = task.await;
+                return Ok(());
+            }
+            joined = &mut task => {
+                match joined {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "newHeads subscription ended; reconnecting");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(error) if error.is_cancelled() => {
+                        return Err(LiveTaskError::TaskCancelled(LiveTask::Wakeups));
+                    }
+                    Err(error) if error.is_panic() => {
+                        return Err(LiveTaskError::TaskPanicked(LiveTask::Wakeups));
+                    }
+                    Err(error) => {
+                        return Err(LiveTaskError::WebSocketTransient(error.to_string()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn poll_wakeup_task(
+    poll_interval: Duration,
+    wakeups: NewHeadWakeupSender,
+    shutdown: CancellationToken,
+) -> Result<(), LiveTaskError> {
+    let mut poll = tokio::time::interval(poll_interval);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = poll.tick() => {
+                let _ = wakeups.try_wake();
+            }
+        }
+    }
+}
+
+async fn tracker_task(
+    writer: PostgresChainWriter,
+    mut source: RpcReconciliationSource,
+    options: LiveCommandOptions,
+    max_reorg_depth: u64,
+    mut reconnect: ReconnectLoop,
+    health: HealthState,
+    context: StatusContext,
+    mut wakeup_rx: mpsc::Receiver<()>,
+    shutdown: CancellationToken,
+) -> Result<(), LiveTaskError> {
     reconcile_and_publish(
         &writer,
         &mut source,
         &options,
-        config.indexer.max_reorg_depth,
+        max_reorg_depth,
         &mut reconnect,
         &health,
-        &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+        &context,
         &wakeup_rx,
         None,
     )
-    .await?;
+    .await
+    .map_err(live_runtime_error_to_task)?;
 
     loop {
         tokio::select! {
@@ -582,106 +700,45 @@ pub async fn run_live(
                     &source,
                     &reconnect,
                     &health,
-                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                    &context,
                     &wakeup_rx,
                     0,
-                ).await?;
-                if let Some(task) = &new_heads_task {
-                    task.abort();
-                }
-                observability_task.abort();
-                tokio::time::sleep(options.shutdown_timeout.min(Duration::from_millis(50))).await;
+                )
+                .await
+                .map_err(live_runtime_error_to_task)?;
                 return Ok(());
             }
-            _ = poll.tick() => {
-                reconcile_and_publish(
-                    &writer,
-                    &mut source,
-                    &options,
-                    config.indexer.max_reorg_depth,
-                    &mut reconnect,
-                    &health,
-                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
-                    &wakeup_rx,
-                    None,
-                ).await?;
-            }
             maybe_wakeup = wakeup_rx.recv() => {
-                if maybe_wakeup.is_some() {
-                    reconcile_and_publish(
-                        &writer,
-                        &mut source,
-                        &options,
-                        config.indexer.max_reorg_depth,
-                        &mut reconnect,
-                        &health,
-                        &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
-                        &wakeup_rx,
-                        None,
-                    ).await?;
-                }
-            }
-            joined = async {
-                match &mut new_heads_task {
-                    Some(task) => Some(task.await),
-                    None => std::future::pending().await,
-                }
-            } => {
-                reconnect.record_disconnect();
-                publish_status(
-                    &writer,
-                    &source,
-                    &reconnect,
-                    &health,
-                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
-                    &wakeup_rx,
-                    0,
-                ).await?;
-                warn!(result = ?joined, "newHeads subscription ended; reconnecting after backoff");
-                let ReconnectAction::RetryAfter(delay) = reconnect.record_availability_failure() else {
+                let Some(()) = maybe_wakeup else {
                     return Ok(());
                 };
-                tokio::time::sleep(delay).await;
-                reconnect.record_subscribed_for_wakeups();
-                new_heads_task = if is_ws_url(&config.rpc.primary_url) {
-                    Some(spawn_new_heads_wakeup(
-                        config.rpc.primary_url.clone(),
-                        wakeups.clone(),
-                    ))
-                } else {
-                    None
-                };
                 reconcile_and_publish(
                     &writer,
                     &mut source,
                     &options,
-                    config.indexer.max_reorg_depth,
+                    max_reorg_depth,
                     &mut reconnect,
                     &health,
-                    &StatusContext::new(config, &primary_redacted, verifier_redacted.as_deref()),
+                    &context,
                     &wakeup_rx,
                     None,
-                ).await?;
+                )
+                .await
+                .map_err(live_runtime_error_to_task)?;
             }
         }
     }
 }
 
-struct StatusContext<'a> {
-    primary_rpc_url: &'a str,
-    verifier_rpc_url: Option<&'a str>,
-}
-
-impl<'a> StatusContext<'a> {
-    fn new(
-        _config: &AppConfig,
-        primary_rpc_url: &'a str,
-        verifier_rpc_url: Option<&'a str>,
-    ) -> Self {
-        Self {
-            primary_rpc_url,
-            verifier_rpc_url,
+fn live_runtime_error_to_task(error: LiveRuntimeError) -> LiveTaskError {
+    match error {
+        LiveRuntimeError::Task(error) => error,
+        LiveRuntimeError::RpcEndpoint { source, .. } | LiveRuntimeError::Rpc(source) => {
+            LiveTaskError::RpcTransient(source.to_string())
         }
+        LiveRuntimeError::Sink(error) => LiveTaskError::DatabaseTransient(error.to_string()),
+        LiveRuntimeError::Backfill(error) => LiveTaskError::DatabaseTransient(error.to_string()),
+        error => LiveTaskError::TaskFailed(LiveTask::Tracker, error.to_string()),
     }
 }
 
@@ -692,7 +749,7 @@ async fn reconcile_and_publish(
     max_reorg_depth: u64,
     reconnect: &mut ReconnectLoop,
     health: &HealthState,
-    context: &StatusContext<'_>,
+    context: &StatusContext,
     wakeup_rx: &mpsc::Receiver<()>,
     unreconciled_gap_count: Option<u64>,
 ) -> Result<(), LiveRuntimeError> {
@@ -729,7 +786,6 @@ async fn reconcile_once(
         max_reorg_depth,
         live_budget_cost_units_per_minute: options.budget_cost_units_per_window,
         poll_interval: options.poll_interval,
-        queue_capacity: 1,
         explicit_start: options.start_block,
         finalized_height: None,
         budget_window: options.budget_window,
@@ -748,7 +804,7 @@ async fn reconcile_once(
         tracker
             .run(&mut tracker_source, &mut tracker_sink, std::iter::empty())
             .map_err(|error| {
-                LiveRuntimeError::Pipeline(LivePipelineError::DatabaseTransient(error.to_string()))
+                LiveRuntimeError::Task(LiveTaskError::DatabaseTransient(error.to_string()))
             })
     })
 }
@@ -758,7 +814,7 @@ async fn publish_status(
     source: &RpcReconciliationSource,
     reconnect: &ReconnectLoop,
     health: &HealthState,
-    context: &StatusContext<'_>,
+    context: &StatusContext,
     wakeup_rx: &mpsc::Receiver<()>,
     unreconciled_gap_count: u64,
 ) -> Result<(), LiveRuntimeError> {
@@ -780,7 +836,7 @@ async fn publish_status(
             ready,
             readiness: readiness.to_owned(),
             primary_rpc_url: Some(context.primary_rpc_url.to_owned()),
-            verifier_rpc_url: context.verifier_rpc_url.map(ToOwned::to_owned),
+            verifier_rpc_url: context.verifier_rpc_url.clone(),
             current_lag_blocks,
             reconnect_count: reconnect.attempts(),
             wakeup_depth: wakeup_rx.len(),
@@ -1254,10 +1310,10 @@ impl ReconnectLoop {
     }
 
     #[must_use]
-    pub fn record_pipeline_error(&mut self, error: &LivePipelineError) -> ReconnectAction {
+    pub fn record_task_error(&mut self, error: &LiveTaskError) -> ReconnectAction {
         match error.classify() {
-            LivePipelineErrorClass::Transient => self.record_availability_failure(),
-            LivePipelineErrorClass::Correctness => self.record_correctness_error(),
+            LiveTaskErrorClass::Transient => self.record_availability_failure(),
+            LiveTaskErrorClass::Correctness => self.record_correctness_error(),
         }
     }
 
@@ -1278,269 +1334,110 @@ fn saturating_duration_mul(duration: Duration, multiplier: u64) -> Duration {
     Duration::from_nanos(nanos as u64)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LivePipelineStage {
-    Fetch,
-    Coordinate,
-    RawPassThrough,
-    Write,
-}
-
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum LivePipelineError {
-    #[error("live pipeline correctness error: {0}")]
+pub enum LiveTaskError {
+    #[error("live runtime correctness error: {0}")]
     Chain(#[from] ChainError),
-    #[error("live pipeline transient RPC error: {0}")]
+    #[error("live runtime transient RPC error: {0}")]
     RpcTransient(String),
-    #[error("live pipeline transient WebSocket error: {0}")]
+    #[error("live runtime transient WebSocket error: {0}")]
     WebSocketTransient(String),
-    #[error("live pipeline transient database error: {0}")]
+    #[error("live runtime transient database error: {0}")]
     DatabaseTransient(String),
-    #[error("live pipeline channel for {0:?} closed")]
-    ChannelClosed(LivePipelineStage),
-    #[error("live pipeline shutdown while {0:?} was waiting")]
-    Shutdown(LivePipelineStage),
-    #[error("live pipeline stage {0:?} panicked")]
-    StagePanicked(LivePipelineStage),
-    #[error("live pipeline stage {0:?} was cancelled")]
-    StageCancelled(LivePipelineStage),
-    #[error("live pipeline stage {0:?} exited before shutdown")]
-    StageExitedEarly(LivePipelineStage),
-    #[error("live pipeline supervisor task was cancelled")]
+    #[error("live runtime task {0:?} panicked")]
+    TaskPanicked(LiveTask),
+    #[error("live runtime task {0:?} was cancelled")]
+    TaskCancelled(LiveTask),
+    #[error("live runtime task {0:?} exited before shutdown")]
+    TaskExitedEarly(LiveTask),
+    #[error("live runtime task {0:?} failed: {1}")]
+    TaskFailed(LiveTask, String),
+    #[error("live runtime supervisor task was cancelled")]
     SupervisorCancelled,
-    #[error("live pipeline queue capacity must be nonzero")]
-    InvalidQueueCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LivePipelineErrorClass {
+pub enum LiveTaskErrorClass {
     Transient,
     Correctness,
 }
 
-impl LivePipelineError {
+impl LiveTaskError {
     #[must_use]
-    pub const fn classify(&self) -> LivePipelineErrorClass {
+    pub const fn classify(&self) -> LiveTaskErrorClass {
         match self {
             Self::RpcTransient(_) | Self::WebSocketTransient(_) | Self::DatabaseTransient(_) => {
-                LivePipelineErrorClass::Transient
+                LiveTaskErrorClass::Transient
             }
             Self::Chain(_)
-            | Self::ChannelClosed(_)
-            | Self::Shutdown(_)
-            | Self::StagePanicked(_)
-            | Self::StageCancelled(_)
-            | Self::StageExitedEarly(_)
-            | Self::SupervisorCancelled
-            | Self::InvalidQueueCapacity => LivePipelineErrorClass::Correctness,
+            | Self::TaskPanicked(_)
+            | Self::TaskCancelled(_)
+            | Self::TaskExitedEarly(_)
+            | Self::TaskFailed(_, _)
+            | Self::SupervisorCancelled => LiveTaskErrorClass::Correctness,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LivePipelineConfig {
-    pub fetch_queue: usize,
-    pub coordinate_queue: usize,
-    pub raw_queue: usize,
-    pub write_queue: usize,
+pub enum LiveTask {
+    HealthServer,
+    Wakeups,
+    Poll,
+    Tracker,
 }
 
-impl LivePipelineConfig {
-    #[must_use]
-    pub const fn new(
-        fetch_queue: usize,
-        coordinate_queue: usize,
-        raw_queue: usize,
-        write_queue: usize,
-    ) -> Self {
-        Self {
-            fetch_queue,
-            coordinate_queue,
-            raw_queue,
-            write_queue,
-        }
-    }
-}
-
-pub struct LivePipelineQueues<Fetch, Coordinate, Raw, Write> {
-    pub fetch_tx: mpsc::Sender<Fetch>,
-    pub fetch_rx: mpsc::Receiver<Fetch>,
-    pub coordinate_tx: mpsc::Sender<Coordinate>,
-    pub coordinate_rx: mpsc::Receiver<Coordinate>,
-    pub raw_tx: mpsc::Sender<Raw>,
-    pub raw_rx: mpsc::Receiver<Raw>,
-    pub write_tx: mpsc::Sender<Write>,
-    pub write_rx: mpsc::Receiver<Write>,
-}
-
-/// Builds the bounded live pipeline queues in fetch -> coordinate -> raw pass-through -> write
-/// order. Each queue must have an explicit nonzero capacity.
-///
-/// # Errors
-///
-/// Returns an error when any queue capacity is zero.
-pub fn bounded_live_pipeline_queues<Fetch, Coordinate, Raw, Write>(
-    config: LivePipelineConfig,
-) -> Result<LivePipelineQueues<Fetch, Coordinate, Raw, Write>, LivePipelineError> {
-    if config.fetch_queue == 0
-        || config.coordinate_queue == 0
-        || config.raw_queue == 0
-        || config.write_queue == 0
-    {
-        return Err(LivePipelineError::InvalidQueueCapacity);
-    }
-
-    let (fetch_tx, fetch_rx) = mpsc::channel(config.fetch_queue);
-    let (coordinate_tx, coordinate_rx) = mpsc::channel(config.coordinate_queue);
-    let (raw_tx, raw_rx) = mpsc::channel(config.raw_queue);
-    let (write_tx, write_rx) = mpsc::channel(config.write_queue);
-
-    Ok(LivePipelineQueues {
-        fetch_tx,
-        fetch_rx,
-        coordinate_tx,
-        coordinate_rx,
-        raw_tx,
-        raw_rx,
-        write_tx,
-        write_rx,
-    })
-}
-
-/// Sends one item to the next bounded stage, waiting behind normal backpressure until the next
-/// stage has capacity or shutdown is requested.
-///
-/// # Errors
-///
-/// Returns a pipeline error when the queue closes or shutdown is requested.
-pub async fn send_with_shutdown<T>(
-    stage: LivePipelineStage,
-    sender: &mpsc::Sender<T>,
-    item: T,
-    shutdown: &CancellationToken,
-) -> Result<(), LivePipelineError>
-where
-    T: Send + 'static,
-{
-    tokio::select! {
-        () = shutdown.cancelled() => Err(LivePipelineError::Shutdown(stage)),
-        result = sender.send(item) => result.map_err(|_| LivePipelineError::ChannelClosed(stage)),
-    }
-}
-
-/// Runs the M4 raw decode stage as a strict pass-through. ABI decoding is intentionally deferred.
-///
-/// # Errors
-///
-/// Returns a pipeline error when shutdown, timeout, or downstream closure occurs.
-pub async fn raw_pass_through_stage<T>(
-    mut receiver: mpsc::Receiver<T>,
-    sender: mpsc::Sender<T>,
+pub struct LiveTaskSupervisor {
     shutdown: CancellationToken,
-) -> Result<(), LivePipelineError>
-where
-    T: Send + 'static,
-{
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return Err(LivePipelineError::Shutdown(LivePipelineStage::RawPassThrough)),
-            item = receiver.recv() => {
-                let Some(item) = item else {
-                    return Ok(());
-                };
-                send_with_shutdown(
-                    LivePipelineStage::RawPassThrough,
-                    &sender,
-                    item,
-                    &shutdown,
-                )
-                .await?;
-            }
-        }
-    }
+    tasks: JoinSet<(LiveTask, Result<(), LiveTaskError>)>,
 }
 
-/// Runs the final write stage. This is the only pipeline stage that receives a mutating closure.
-///
-/// # Errors
-///
-/// Returns a pipeline error when shutdown is requested or the writer closure fails.
-pub async fn writer_stage<T, Write, WriteFuture>(
-    mut receiver: mpsc::Receiver<T>,
-    mut write: Write,
-    shutdown: CancellationToken,
-) -> Result<(), LivePipelineError>
-where
-    T: Send + 'static,
-    Write: FnMut(T) -> WriteFuture,
-    WriteFuture: Future<Output = Result<(), LivePipelineError>>,
-{
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return Err(LivePipelineError::Shutdown(LivePipelineStage::Write)),
-            item = receiver.recv() => {
-                let Some(item) = item else {
-                    return Ok(());
-                };
-                write(item).await?;
-            }
-        }
-    }
-}
-
-pub struct LivePipelineSupervisor {
-    shutdown: CancellationToken,
-    stages: JoinSet<(LivePipelineStage, Result<(), LivePipelineError>)>,
-}
-
-impl LivePipelineSupervisor {
+impl LiveTaskSupervisor {
     #[must_use]
     pub fn new(shutdown: CancellationToken) -> Self {
         Self {
             shutdown,
-            stages: JoinSet::new(),
+            tasks: JoinSet::new(),
         }
     }
 
-    pub fn spawn<Fut>(&mut self, stage: LivePipelineStage, future: Fut)
+    pub fn spawn<Fut>(&mut self, task: LiveTask, future: Fut)
     where
-        Fut: Future<Output = Result<(), LivePipelineError>> + Send + 'static,
+        Fut: Future<Output = Result<(), LiveTaskError>> + Send + 'static,
     {
-        self.stages.spawn(async move {
+        self.tasks.spawn(async move {
             let result = AssertUnwindSafe(future).catch_unwind().await;
             let result = match result {
                 Ok(result) => result,
-                Err(_) => Err(LivePipelineError::StagePanicked(stage)),
+                Err(_) => Err(LiveTaskError::TaskPanicked(task)),
             };
-            (stage, result)
+            (task, result)
         });
     }
 
-    /// Waits for the first stage to finish, then cancels and drains the rest of the pipeline.
-    /// A clean stage exit before shutdown is treated as a pipeline failure because live stages
+    /// Waits for the first task to finish, then cancels and drains the rest of the runner.
+    /// A clean task exit before shutdown is treated as a failure because live tasks
     /// should run until cancellation or an explicit error.
     ///
     /// # Errors
     ///
-    /// Returns the first stage error, panic, premature exit, or supervisor cancellation.
-    pub async fn run_until_first_exit(mut self) -> Result<(), LivePipelineError> {
-        let Some(joined) = self.stages.join_next().await else {
+    /// Returns the first task error, panic, premature exit, or supervisor cancellation.
+    pub async fn run_until_first_exit(mut self) -> Result<(), LiveTaskError> {
+        let Some(joined) = self.tasks.join_next().await else {
             return Ok(());
         };
 
         let first_result = match joined {
-            Ok((_stage, Ok(()))) if self.shutdown.is_cancelled() => Ok(()),
-            Ok((stage, Ok(()))) => Err(LivePipelineError::StageExitedEarly(stage)),
-            Ok((_stage, Err(error))) => Err(error),
-            Err(error) if error.is_cancelled() => Err(LivePipelineError::SupervisorCancelled),
-            Err(error) if error.is_panic() => {
-                Err(LivePipelineError::StagePanicked(LivePipelineStage::Fetch))
-            }
-            Err(_) => Err(LivePipelineError::SupervisorCancelled),
+            Ok((_task, Ok(()))) if self.shutdown.is_cancelled() => Ok(()),
+            Ok((task, Ok(()))) => Err(LiveTaskError::TaskExitedEarly(task)),
+            Ok((_task, Err(error))) => Err(error),
+            Err(error) if error.is_cancelled() => Err(LiveTaskError::SupervisorCancelled),
+            Err(error) if error.is_panic() => Err(LiveTaskError::TaskPanicked(LiveTask::Tracker)),
+            Err(_) => Err(LiveTaskError::SupervisorCancelled),
         };
 
         self.shutdown.cancel();
-        while self.stages.join_next().await.is_some() {}
+        while self.tasks.join_next().await.is_some() {}
         first_result
     }
 }
@@ -1555,7 +1452,6 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
-        sync::Notify,
     };
 
     #[test]
@@ -1862,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn max_depth_pipeline_error_halts_reconnect_without_retry() {
+    fn max_depth_task_error_halts_reconnect_without_retry() {
         let policy = ReconnectPolicy::new(
             Duration::from_secs(1),
             Duration::from_secs(5),
@@ -1871,190 +1767,33 @@ mod tests {
         )
         .unwrap();
         let mut reconnect = ReconnectLoop::new(policy);
-        let error = LivePipelineError::Chain(ChainError::MaxDepthExceeded { max_depth: 3 });
+        let error = LiveTaskError::Chain(ChainError::MaxDepthExceeded { max_depth: 3 });
 
-        assert_eq!(error.classify(), LivePipelineErrorClass::Correctness);
-        assert_eq!(
-            reconnect.record_pipeline_error(&error),
-            ReconnectAction::Halt
-        );
+        assert_eq!(error.classify(), LiveTaskErrorClass::Correctness);
+        assert_eq!(reconnect.record_task_error(&error), ReconnectAction::Halt);
         assert!(reconnect.is_halted());
         assert_eq!(reconnect.attempts(), 0);
     }
 
-    #[test]
-    fn bounded_pipeline_queues_use_configured_capacities() {
-        let queues: LivePipelineQueues<u64, u64, u64, u64> =
-            bounded_live_pipeline_queues(LivePipelineConfig::new(1, 2, 3, 4)).unwrap();
-
-        assert_eq!(queues.fetch_tx.max_capacity(), 1);
-        assert_eq!(queues.coordinate_tx.max_capacity(), 2);
-        assert_eq!(queues.raw_tx.max_capacity(), 3);
-        assert_eq!(queues.write_tx.max_capacity(), 4);
-    }
-
-    #[test]
-    fn bounded_pipeline_rejects_zero_capacity() {
-        let result =
-            bounded_live_pipeline_queues::<u64, u64, u64, u64>(LivePipelineConfig::new(1, 0, 1, 1));
-
-        assert!(matches!(
-            result,
-            Err(LivePipelineError::InvalidQueueCapacity)
-        ));
-    }
-
     #[tokio::test]
-    async fn full_queue_send_waits_for_capacity_without_failing() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender.send(10_u64).await.unwrap();
+    async fn task_supervisor_treats_clean_early_exit_as_failure_and_cancels_rest() {
         let shutdown = CancellationToken::new();
-        let send_shutdown = shutdown.clone();
+        let sibling_cancelled = Arc::new(AtomicUsize::new(0));
+        let sibling_cancelled_for_task = Arc::clone(&sibling_cancelled);
+        let sibling_shutdown = shutdown.clone();
+        let mut supervisor = LiveTaskSupervisor::new(shutdown);
 
-        let blocked_send = tokio::spawn(async move {
-            send_with_shutdown(LivePipelineStage::Fetch, &sender, 11_u64, &send_shutdown).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!blocked_send.is_finished());
-        assert_eq!(receiver.recv().await, Some(10));
-        assert_eq!(blocked_send.await.unwrap(), Ok(()));
-        assert_eq!(receiver.recv().await, Some(11));
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_full_channel_send_without_hanging() {
-        let (sender, _receiver) = mpsc::channel(1);
-        sender.send(10_u64).await.unwrap();
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(50),
-            send_with_shutdown(LivePipelineStage::Coordinate, &sender, 11_u64, &shutdown),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result,
-            Err(LivePipelineError::Shutdown(LivePipelineStage::Coordinate))
-        );
-    }
-
-    #[tokio::test]
-    async fn raw_pass_through_preserves_event_order() {
-        let (raw_tx, raw_rx) = mpsc::channel(2);
-        let (write_tx, mut write_rx) = mpsc::channel(2);
-        let shutdown = CancellationToken::new();
-
-        raw_tx.send(31_u64).await.unwrap();
-        raw_tx.send(32_u64).await.unwrap();
-        drop(raw_tx);
-
-        raw_pass_through_stage(raw_rx, write_tx, shutdown)
-            .await
-            .unwrap();
-
-        assert_eq!(write_rx.recv().await, Some(31));
-        assert_eq!(write_rx.recv().await, Some(32));
-        assert_eq!(write_rx.recv().await, None);
-    }
-
-    #[tokio::test]
-    async fn writer_stage_is_the_only_mutating_stage() {
-        let (write_tx, write_rx) = mpsc::channel(2);
-        write_tx.send(41_u64).await.unwrap();
-        write_tx.send(42_u64).await.unwrap();
-        drop(write_tx);
-        let mutation_count = Arc::new(AtomicUsize::new(0));
-        let mutation_count_for_writer = Arc::clone(&mutation_count);
-
-        writer_stage(
-            write_rx,
-            move |item| {
-                let mutation_count = Arc::clone(&mutation_count_for_writer);
-                async move {
-                    assert!(item == 41 || item == 42);
-                    mutation_count.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(mutation_count.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn shutdown_waits_for_in_flight_write_to_finish() {
-        let (write_tx, write_rx) = mpsc::channel(1);
-        write_tx.send(41_u64).await.unwrap();
-        drop(write_tx);
-        let shutdown = CancellationToken::new();
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let completed = Arc::new(AtomicUsize::new(0));
-        let started_for_writer = Arc::clone(&started);
-        let release_for_writer = Arc::clone(&release);
-        let completed_for_writer = Arc::clone(&completed);
-        let writer_shutdown = shutdown.clone();
-
-        let task = tokio::spawn(async move {
-            writer_stage(
-                write_rx,
-                move |_| {
-                    let started = Arc::clone(&started_for_writer);
-                    let release = Arc::clone(&release_for_writer);
-                    let completed = Arc::clone(&completed_for_writer);
-                    async move {
-                        started.notify_one();
-                        release.notified().await;
-                        completed.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    }
-                },
-                writer_shutdown,
-            )
-            .await
-        });
-
-        started.notified().await;
-        shutdown.cancel();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!task.is_finished());
-        assert_eq!(completed.load(Ordering::SeqCst), 0);
-
-        release.notify_one();
-        let result = task.await.unwrap();
-        assert!(
-            result == Ok(())
-                || result == Err(LivePipelineError::Shutdown(LivePipelineStage::Write))
-        );
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn pipeline_supervisor_reports_upstream_panic_over_downstream_clean_exit() {
-        let shutdown = CancellationToken::new();
-        let (sender, mut receiver) = mpsc::channel::<u64>(1);
-        let mut supervisor = LivePipelineSupervisor::new(shutdown);
-
-        supervisor.spawn(LivePipelineStage::Fetch, async move {
-            drop(sender);
-            panic!("fetch stage panic is supervised");
-        });
-        supervisor.spawn(LivePipelineStage::Write, async move {
-            assert_eq!(receiver.recv().await, None);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        supervisor.spawn(LiveTask::Poll, async { Ok(()) });
+        supervisor.spawn(LiveTask::Tracker, async move {
+            sibling_shutdown.cancelled().await;
+            sibling_cancelled_for_task.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
 
         assert_eq!(
             supervisor.run_until_first_exit().await,
-            Err(LivePipelineError::StagePanicked(LivePipelineStage::Fetch))
+            Err(LiveTaskError::TaskExitedEarly(LiveTask::Poll))
         );
+        assert_eq!(sibling_cancelled.load(Ordering::SeqCst), 1);
     }
 }

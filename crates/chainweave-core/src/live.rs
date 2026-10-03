@@ -13,7 +13,6 @@ pub struct LiveConfig {
     pub max_reorg_depth: u64,
     pub live_budget_cost_units_per_minute: u64,
     pub poll_interval: Duration,
-    pub queue_capacity: usize,
     pub explicit_start: Option<u64>,
     pub finalized_height: Option<u64>,
     pub budget_window: Duration,
