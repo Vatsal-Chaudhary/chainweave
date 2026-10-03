@@ -219,7 +219,7 @@ Each milestone should ship with tests and a short demo (CLI output / log trace) 
 ### M0 — Scaffolding & RPC Foundation
 - Cargo workspace: `chainweave-core`, `chainweave-rpc`, `chainweave-sink`, `chainweave-cli`
 - Alloy provider wired up (HTTP + WS), config via `figment` (primary RPC URL, optional verifier RPC, DB URL, optional Kafka brokers, cache size, `max_reorg_depth`, confirmation fallbacks)
-- Validate chain identity, URLs, depth relationships, queue capacities, and required secrets before starting workers
+- Validate chain identity, URLs, depth relationships, and required secrets before starting workers
 - `tracing` + basic Prometheus `/metrics`, `/health`, and `/ready` endpoints stubbed
 - **Acceptance:** deterministic Anvil/fixture test prints the current head and rejects a chain ID/genesis mismatch; an opt-in `chainweave head` smoke test reads a real testnet RPC without making public RPC availability a CI requirement.
 
@@ -253,9 +253,9 @@ Each milestone should ship with tests and a short demo (CLI output / log trace) 
 ### M4 — Real-Time Streaming (Live Tip Tracking)
 - Alloy WS subscription for low-latency head wakeups, with ordered `watch_canonical_*_from`/polling or explicit range reconciliation from the durable checkpoint
 - On WS disconnect, reconnect with jittered backoff, query the current head, and fetch every missing height; never assume notifications are complete
-- Bounded `mpsc` channels between fetch → coordinate → decode → write stages with documented capacities, blocking policy, timeouts, and supervised task failure behavior
+- Sequential reconciliation from the durable checkpoint with one block per normal-extension transaction and natural RPC/Postgres backpressure; WS `newHeads` uses a capacity-1 coalescing wakeup channel only
 - Optional secondary provider verifies chain identity, height lag, and recent hashes. Disagreement raises health/metrics alerts and degrades readiness; verifier pause policy is deferred, and v1 does not silently fail over or vote on fork choice
-- **Acceptance:** deterministic tests drop, duplicate, and reorder head notifications and force reconnects without losing a block. Then run against a live testnet for 24h: zero unreconciled gaps, zero panics, bounded queue depth, and RSS remaining within a stated bound after warm-up.
+- **Acceptance:** deterministic tests drop, duplicate, and reorder head notifications and force reconnects without losing a block. Then run against a live testnet for 24h: zero unreconciled gaps, zero panics, wakeup depth never above the capacity-1 coalescing channel, and RSS remaining within a stated bound after warm-up.
 
 ### M5 — Pluggable ABI Decoding
 - Contract registry: address → versioned ABI mapping (config file or DB table), decode retained raw logs into typed JSON using Alloy's ABI tooling

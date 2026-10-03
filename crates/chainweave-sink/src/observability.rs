@@ -27,7 +27,7 @@ struct StatusSnapshot {
     verifier_rpc_url: Option<String>,
     current_lag_blocks: u64,
     reconnect_count: u64,
-    queue_depths: QueueDepths,
+    wakeup_depth: usize,
     unreconciled_gap_count: u64,
     verifier_disagreement_count: u64,
 }
@@ -60,18 +60,9 @@ struct StatusBody {
     verifier_rpc_url: Option<String>,
     current_lag_blocks: u64,
     reconnect_count: u64,
-    queue_depths: QueueDepths,
+    wakeup_depth: usize,
     unreconciled_gap_count: u64,
     verifier_disagreement_count: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
-pub struct QueueDepths {
-    pub wakeups: usize,
-    pub fetch: usize,
-    pub coordinate: usize,
-    pub decode: usize,
-    pub write: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +74,7 @@ pub struct LiveStatusSnapshot {
     pub verifier_rpc_url: Option<String>,
     pub current_lag_blocks: u64,
     pub reconnect_count: u64,
-    pub queue_depths: QueueDepths,
+    pub wakeup_depth: usize,
     pub unreconciled_gap_count: u64,
     pub verifier_disagreement_count: u64,
 }
@@ -98,7 +89,7 @@ impl Default for StatusSnapshot {
             verifier_rpc_url: None,
             current_lag_blocks: 0,
             reconnect_count: 0,
-            queue_depths: QueueDepths::default(),
+            wakeup_depth: 0,
             unreconciled_gap_count: 0,
             verifier_disagreement_count: 0,
         }
@@ -115,7 +106,7 @@ impl From<LiveStatusSnapshot> for StatusSnapshot {
             verifier_rpc_url: snapshot.verifier_rpc_url,
             current_lag_blocks: snapshot.current_lag_blocks,
             reconnect_count: snapshot.reconnect_count,
-            queue_depths: snapshot.queue_depths,
+            wakeup_depth: snapshot.wakeup_depth,
             unreconciled_gap_count: snapshot.unreconciled_gap_count,
             verifier_disagreement_count: snapshot.verifier_disagreement_count,
         }
@@ -137,7 +128,7 @@ impl From<StatusSnapshot> for StatusBody {
             verifier_rpc_url: snapshot.verifier_rpc_url,
             current_lag_blocks: snapshot.current_lag_blocks,
             reconnect_count: snapshot.reconnect_count,
-            queue_depths: snapshot.queue_depths,
+            wakeup_depth: snapshot.wakeup_depth,
             unreconciled_gap_count: snapshot.unreconciled_gap_count,
             verifier_disagreement_count: snapshot.verifier_disagreement_count,
         }
@@ -241,16 +232,7 @@ fn publish_metrics(snapshot: &StatusSnapshot) {
     gauge!("chainweave_live_unreconciled_gap_count").set(snapshot.unreconciled_gap_count as f64);
     gauge!("chainweave_live_verifier_disagreement_count")
         .set(snapshot.verifier_disagreement_count as f64);
-    gauge!("chainweave_live_queue_depth", "queue" => "wakeups")
-        .set(snapshot.queue_depths.wakeups as f64);
-    gauge!("chainweave_live_queue_depth", "queue" => "fetch")
-        .set(snapshot.queue_depths.fetch as f64);
-    gauge!("chainweave_live_queue_depth", "queue" => "coordinate")
-        .set(snapshot.queue_depths.coordinate as f64);
-    gauge!("chainweave_live_queue_depth", "queue" => "decode")
-        .set(snapshot.queue_depths.decode as f64);
-    gauge!("chainweave_live_queue_depth", "queue" => "write")
-        .set(snapshot.queue_depths.write as f64);
+    gauge!("chainweave_live_wakeup_depth").set(snapshot.wakeup_depth as f64);
 }
 
 #[cfg(test)]
@@ -293,13 +275,7 @@ mod tests {
                 verifier_rpc_url: None,
                 current_lag_blocks: 3,
                 reconnect_count: 2,
-                queue_depths: QueueDepths {
-                    wakeups: 1,
-                    fetch: 2,
-                    coordinate: 3,
-                    decode: 4,
-                    write: 5,
-                },
+                wakeup_depth: 1,
                 unreconciled_gap_count: 1,
                 verifier_disagreement_count: 7,
             })
@@ -318,7 +294,7 @@ mod tests {
         assert_eq!(snapshot.readiness, "degraded");
         assert_eq!(snapshot.current_lag_blocks, 3);
         assert_eq!(snapshot.reconnect_count, 2);
-        assert_eq!(snapshot.queue_depths.write, 5);
+        assert_eq!(snapshot.wakeup_depth, 1);
         assert_eq!(snapshot.verifier_disagreement_count, 7);
     }
 }

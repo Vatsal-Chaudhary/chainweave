@@ -1,9 +1,7 @@
 mod observability;
 mod postgres;
 
-pub use observability::{
-    HealthState, LiveStatusSnapshot, ObservabilityError, ObservabilityServer, QueueDepths,
-};
+pub use observability::{HealthState, LiveStatusSnapshot, ObservabilityError, ObservabilityServer};
 pub use postgres::{
     ApplyReport, BlockStatus, CanonicalRangeSummary, Checkpoint, CrashPoint, DurableChainBatch,
     DurableChainEvent, IndexedBlock, NormalizedLogRecord, OutboxEvent, PostgresBackfillCommitter,

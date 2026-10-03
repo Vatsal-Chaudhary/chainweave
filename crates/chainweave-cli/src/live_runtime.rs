@@ -18,7 +18,6 @@ use chainweave_rpc::{
 use chainweave_sink::{
     DurableChainBatch, HealthState, IndexedBlock, LiveStatusSnapshot, ObservabilityError,
     ObservabilityServer, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
-    QueueDepths,
 };
 use futures::FutureExt;
 use thiserror::Error;
@@ -671,25 +670,17 @@ pub async fn run_live(
 struct StatusContext<'a> {
     primary_rpc_url: &'a str,
     verifier_rpc_url: Option<&'a str>,
-    queue_capacities: QueueDepths,
 }
 
 impl<'a> StatusContext<'a> {
     fn new(
-        config: &AppConfig,
+        _config: &AppConfig,
         primary_rpc_url: &'a str,
         verifier_rpc_url: Option<&'a str>,
     ) -> Self {
         Self {
             primary_rpc_url,
             verifier_rpc_url,
-            queue_capacities: QueueDepths {
-                wakeups: 1,
-                fetch: config.queues.fetch,
-                coordinate: config.queues.coordinate,
-                decode: config.queues.decode,
-                write: config.queues.write,
-            },
         }
     }
 }
@@ -792,13 +783,7 @@ async fn publish_status(
             verifier_rpc_url: context.verifier_rpc_url.map(ToOwned::to_owned),
             current_lag_blocks,
             reconnect_count: reconnect.attempts(),
-            queue_depths: QueueDepths {
-                wakeups: wakeup_rx.len(),
-                fetch: 0.min(context.queue_capacities.fetch),
-                coordinate: 0.min(context.queue_capacities.coordinate),
-                decode: 0.min(context.queue_capacities.decode),
-                write: 0.min(context.queue_capacities.write),
-            },
+            wakeup_depth: wakeup_rx.len(),
             unreconciled_gap_count,
             verifier_disagreement_count: verifier_disagreements,
         })
@@ -859,7 +844,7 @@ fn initial_status(primary_rpc_url: &str, verifier_rpc_url: Option<&str>) -> Live
         verifier_rpc_url: verifier_rpc_url.map(ToOwned::to_owned),
         current_lag_blocks: 0,
         reconnect_count: 0,
-        queue_depths: QueueDepths::default(),
+        wakeup_depth: 0,
         unreconciled_gap_count: 0,
         verifier_disagreement_count: 0,
     }
