@@ -1425,6 +1425,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chainweave-core",
+ "metrics",
  "metrics-exporter-prometheus",
  "serde",
  "serde_json",

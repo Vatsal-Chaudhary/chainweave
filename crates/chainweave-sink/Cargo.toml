@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 chainweave-core = { path = "../chainweave-core" }
+metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
