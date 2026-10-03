@@ -6,9 +6,9 @@ use std::{
 
 use chainweave_core::{
     AppConfig, BackfillRange, BlockHash, BlockHeader, ChainBatch, ChainError, ConfigError,
-    FetchedRange, LiveConfig, LiveError, LiveReport, LiveSink, LiveSource, LiveStartPoint,
-    LiveTracker, OrderedCommitCoordinator, RangeCommitSink, RetryPolicy, RpcBudget, RpcMethod,
-    ValidationProfile, VerifierStatus, redact_url,
+    FetchedRange, LiveConfig, LiveError, LiveReport, LiveSink, LiveSource, LiveSourceErrorKind,
+    LiveStartPoint, LiveTracker, OrderedCommitCoordinator, RangeCommitSink, RetryPolicy, RpcBudget,
+    RpcMethod, ValidationProfile, VerifierStatus, redact_url,
 };
 use chainweave_rpc::{
     ContractLogFilter, NewHeadWakeupSender, RpcClient, RpcError, capture_target_head_with_retry,
@@ -357,6 +357,14 @@ impl LiveSource for BlockingTrackerSource {
 
     fn block_logs_match_header(_block: &Self::Block) -> bool {
         true
+    }
+
+    fn source_error_kind(error: &Self::Error) -> LiveSourceErrorKind {
+        if source_error_requests_rereconcile(error) {
+            LiveSourceErrorKind::Reconcile
+        } else {
+            LiveSourceErrorKind::Transient
+        }
     }
 
     fn verify_recent(
@@ -795,12 +803,22 @@ fn live_tracker_error_to_runtime(error: LiveError) -> LiveRuntimeError {
             LiveRuntimeError::Task(LiveTaskError::TaskCancelled(LiveTask::Tracker))
         }
         LiveError::Chain(error) => LiveRuntimeError::Task(LiveTaskError::Chain(error)),
-        LiveError::Source(error) => LiveRuntimeError::Task(LiveTaskError::RpcTransient(error)),
+        LiveError::Reconcile(error) | LiveError::Source(error) => {
+            LiveRuntimeError::Task(LiveTaskError::RpcTransient(error))
+        }
         LiveError::Sink(error) => LiveRuntimeError::Task(LiveTaskError::DatabaseTransient(error)),
         LiveError::Backfill(error) => {
             LiveRuntimeError::Task(LiveTaskError::DatabaseTransient(error.to_string()))
         }
     }
+}
+
+fn source_error_requests_rereconcile(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let hash_anchored_block_not_found = lower.contains("eth_getlogs")
+        && (lower.contains("blockhash") || lower.contains("block hash"))
+        && lower.contains("block not found");
+    hash_anchored_block_not_found || lower.contains("rpc log block hash does not match")
 }
 
 async fn reconcile_and_publish(
@@ -1719,6 +1737,16 @@ mod tests {
         assert!(!primary.contains("path-secret"));
         assert!(!verifier.unwrap().contains("query-secret"));
         assert!(primary.contains("redacted"));
+    }
+
+    #[test]
+    fn hash_anchored_log_block_not_found_requests_rereconcile() {
+        assert!(source_error_requests_rereconcile(
+            "eth_getLogs blockHash 0xabc failed: block not found"
+        ));
+        assert!(!source_error_requests_rereconcile(
+            "eth_getBlockByNumber failed: block not found"
+        ));
     }
 
     #[test]

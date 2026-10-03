@@ -102,6 +102,12 @@ pub enum VerifierStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSourceErrorKind {
+    Transient,
+    Reconcile,
+}
+
 pub trait LiveSource {
     type Block: Clone;
     type Error: std::fmt::Display;
@@ -114,6 +120,9 @@ pub trait LiveSource {
     fn block_header(block: &Self::Block) -> BlockHeader;
     fn block_logs_match_header(_block: &Self::Block) -> bool {
         true
+    }
+    fn source_error_kind(_error: &Self::Error) -> LiveSourceErrorKind {
+        LiveSourceErrorKind::Transient
     }
 
     fn verify_recent(
@@ -140,6 +149,8 @@ pub enum LiveError {
     Sink(String),
     #[error("live tracker cancelled")]
     Cancelled,
+    #[error("{0}")]
+    Reconcile(String),
     #[error(transparent)]
     Chain(#[from] ChainError),
     #[error(transparent)]
@@ -324,7 +335,12 @@ impl LiveTracker {
                 Ok(()) => {}
                 Err(LiveError::Backfill(BackfillError::FetchedSuffixInvalidated { .. })) => {
                     report.apply_order.clear();
-                    self.apply_chain_state(source, sink, head, budget, report, is_cancelled)?;
+                    self.reconcile_current_head(source, sink, budget, report, is_cancelled)?;
+                    return Ok(());
+                }
+                Err(LiveError::Reconcile(_)) => {
+                    report.apply_order.clear();
+                    self.reconcile_current_head(source, sink, budget, report, is_cancelled)?;
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -351,7 +367,7 @@ impl LiveTracker {
         budget.record(RpcMethod::GetBlockByNumber, report)?;
         let block = source
             .block_by_number(height)
-            .map_err(|error| LiveError::Source(error.to_string()))?;
+            .map_err(Self::source_error::<S>)?;
         budget.record(RpcMethod::GetLogs, report)?;
         let (header, block) =
             self.validate_or_refetch_number(source, height, block, budget, report)?;
@@ -365,6 +381,28 @@ impl LiveTracker {
             report.apply_order.push(height);
         }
         Ok(())
+    }
+
+    fn reconcile_current_head<S, K>(
+        &self,
+        source: &mut S,
+        sink: &mut K,
+        budget: &mut WindowBudget,
+        report: &mut LiveReport,
+        is_cancelled: &impl Fn() -> bool,
+    ) -> Result<(), LiveError>
+    where
+        S: LiveSource,
+        K: LiveSink<S::Block>,
+        K::Error: std::fmt::Display,
+    {
+        ensure_not_cancelled(is_cancelled)?;
+        report.transition(LiveReadiness::Degraded);
+        budget.record(RpcMethod::GetBlockByNumber, report)?;
+        let head = source
+            .current_head()
+            .map_err(|error| LiveError::Source(error.to_string()))?;
+        self.apply_chain_state(source, sink, head, budget, report, is_cancelled)
     }
 
     fn apply_chain_state<S, K>(
@@ -417,7 +455,7 @@ impl LiveTracker {
                     budget.record(RpcMethod::GetBlockByHash, report)?;
                     let block = source
                         .block_by_hash(header.hash)
-                        .map_err(|error| LiveError::Source(error.to_string()))?;
+                        .map_err(Self::source_error::<S>)?;
                     budget.record(RpcMethod::GetLogs, report)?;
                     let block =
                         self.validate_or_refetch_hash(source, *header, block, budget, report)?;
@@ -451,7 +489,7 @@ impl LiveTracker {
         budget.record(RpcMethod::GetBlockByNumber, report)?;
         let block = source
             .block_by_number(height)
-            .map_err(|error| LiveError::Source(error.to_string()))?;
+            .map_err(Self::source_error::<S>)?;
         budget.record(RpcMethod::GetLogs, report)?;
         let header = S::block_header(&block);
         if !S::block_logs_match_header(&block) {
@@ -481,7 +519,7 @@ impl LiveTracker {
         budget.record(RpcMethod::GetBlockByHash, report)?;
         let block = source
             .block_by_hash(expected.hash)
-            .map_err(|error| LiveError::Source(error.to_string()))?;
+            .map_err(Self::source_error::<S>)?;
         budget.record(RpcMethod::GetLogs, report)?;
         if S::block_header(&block) != expected || !S::block_logs_match_header(&block) {
             return Err(LiveError::Source(format!(
@@ -490,6 +528,18 @@ impl LiveTracker {
             )));
         }
         Ok(block)
+    }
+
+    fn source_error<S>(error: S::Error) -> LiveError
+    where
+        S: LiveSource,
+    {
+        let kind = S::source_error_kind(&error);
+        let message = error.to_string();
+        match kind {
+            LiveSourceErrorKind::Transient => LiveError::Source(message),
+            LiveSourceErrorKind::Reconcile => LiveError::Reconcile(message),
+        }
     }
 }
 

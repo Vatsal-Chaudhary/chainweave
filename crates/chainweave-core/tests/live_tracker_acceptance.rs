@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use chainweave_core::{
     BlockHash, BlockHeader, ChainBatch, ChainEvent, FetchedRange, LiveConfig, LiveHaltReason,
-    LiveHeadEvent, LiveReadiness, LiveSink, LiveSource, LiveTracker, RangeCommitSink, RetryPolicy,
-    RpcMethod, VerifierStatus,
+    LiveHeadEvent, LiveReadiness, LiveSink, LiveSource, LiveSourceErrorKind, LiveTracker,
+    RangeCommitSink, RetryPolicy, RpcMethod, VerifierStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -53,13 +53,13 @@ struct FakeHeadStream {
     events: Vec<HeadEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FakeBlock {
     header: BlockHeader,
     logs: Vec<FakeLog>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FakeLog {
     block_hash: BlockHash,
     log_index: u32,
@@ -97,6 +97,7 @@ enum LiveFault {
     ShorterForkAtCurrentHeight { height: u64 },
     ReorgDuringCatchUp { at_height: u64 },
     BlockHashLogMismatch { height: u64 },
+    BlockHashLogsBlockNotFoundThenReorg { height: u64 },
     UnknownParentRequiresHash(BlockHash),
     TimeoutOnce(RpcMethod),
     RateLimitOnce(RpcMethod),
@@ -358,6 +359,47 @@ fn block_hash_log_mismatch_restarts_reconciliation_without_commit() {
                 block(&chain, 71).header.hash,
                 block(&chain, 71).header.hash,
             ]),
+    );
+}
+
+#[test]
+fn block_hash_logs_block_not_found_mid_catch_up_rereconciles_to_clean_run() {
+    let old = linear_blocks(&[210, 211, 212, 213]);
+    let replacement = fork_from(block(&old, 210).header, &[311, 312, 313]);
+    let mut scenario = scenario_with_alt(
+        "blockHash log block not found",
+        "eth_getLogs by blockHash block-not-found after a reorg refreshes head and re-reconciles",
+        Some(block(&old, 210).header),
+        old.clone(),
+        replacement.clone(),
+        vec![HeadEvent::Notify(block(&old, 213).header)],
+        vec![LiveFault::BlockHashLogsBlockNotFoundThenReorg { height: 212 }],
+    );
+    let mut clean = scenario_with_alt(
+        "clean replacement after blockHash block not found",
+        "clean replacement run used as the semantic-state oracle",
+        Some(block(&old, 210).header),
+        old.clone(),
+        replacement.clone(),
+        vec![HeadEvent::Notify(block(&replacement, 213).header)],
+        Vec::new(),
+    );
+
+    let (source, sink, report) = run_live_tracker_raw(&mut scenario).unwrap();
+    let (_, clean_sink, clean_report) = run_live_tracker_raw(&mut clean).unwrap();
+
+    assert_eq!(sink.canonical, clean_sink.canonical);
+    assert_eq!(report.final_checkpoint, clean_report.final_checkpoint);
+    assert_eq!(report.rollback_order, vec![211]);
+    assert_eq!(report.apply_order, vec![211, 212, 213]);
+    assert_eq!(
+        source.log_block_hash_filters.first(),
+        Some(&block(&old, 212).header.hash)
+    );
+    assert!(
+        source
+            .log_block_hash_filters
+            .contains(&block(&replacement, 212).header.hash)
     );
 }
 
@@ -699,7 +741,15 @@ fn expect_live_outcome(scenario: LiveScenario, expected: LiveOutcome) {
 }
 
 fn run_live_tracker(scenario: LiveScenario) -> Result<LiveOutcome, LiveHarnessError> {
-    let _ = consume_scenario(&scenario);
+    let mut scenario = scenario;
+    let (source, sink, report) = run_live_tracker_raw(&mut scenario)?;
+    Ok(outcome_from_report(&scenario, &source, &sink, report))
+}
+
+fn run_live_tracker_raw(
+    scenario: &mut LiveScenario,
+) -> Result<(FakeLiveSource, FakeLiveSink, chainweave_core::LiveReport), LiveHarnessError> {
+    let _ = consume_scenario(scenario);
     let events = live_events(&scenario.heads.events);
     let tracker = LiveTracker::new(live_config(&scenario.config));
     let mut source = FakeLiveSource::new(&scenario);
@@ -709,7 +759,7 @@ fn run_live_tracker(scenario: LiveScenario) -> Result<LiveOutcome, LiveHarnessEr
             scenario: scenario.name,
         }
     })?;
-    Ok(outcome_from_report(&scenario, &source, &sink, report))
+    Ok((source, sink, report))
 }
 
 #[derive(Debug, Clone)]
@@ -722,6 +772,7 @@ struct FakeLiveSource {
     header_by_hash_calls: Vec<BlockHash>,
     log_block_hash_filters: Vec<BlockHash>,
     mismatched_log_once: BTreeSet<u64>,
+    block_hash_log_not_found_once: BTreeSet<u64>,
 }
 
 impl FakeLiveSource {
@@ -744,6 +795,7 @@ impl FakeLiveSource {
             header_by_hash_calls: Vec::new(),
             log_block_hash_filters: Vec::new(),
             mismatched_log_once: BTreeSet::new(),
+            block_hash_log_not_found_once: BTreeSet::new(),
         }
     }
 
@@ -786,8 +838,39 @@ impl FakeLiveSource {
 
     fn records_log_filter(&self, height: u64) -> bool {
         self.faults.iter().any(|fault| {
-            matches!(fault, LiveFault::BlockHashLogMismatch { height: fault_height } if *fault_height == height)
+            matches!(
+                fault,
+                LiveFault::BlockHashLogMismatch {
+                    height: fault_height
+                } | LiveFault::BlockHashLogsBlockNotFoundThenReorg {
+                    height: fault_height
+                } if *fault_height == height
+            )
         })
+    }
+
+    fn maybe_block_hash_log_not_found(&mut self, block: &FakeBlock) -> Result<(), String> {
+        let should_fault = self.faults.iter().any(|fault| {
+            matches!(
+                fault,
+                LiveFault::BlockHashLogsBlockNotFoundThenReorg { height }
+                    if *height == block.header.height
+            )
+        });
+        if should_fault
+            && self
+                .block_hash_log_not_found_once
+                .insert(block.header.height)
+        {
+            if let Some(new_head) = self.alternate.values().last().map(|block| block.header) {
+                self.head = new_head;
+            }
+            return Err(format!(
+                "eth_getLogs blockHash {:?} failed: block not found",
+                block.header.hash
+            ));
+        }
+        Ok(())
     }
 
     fn maybe_mismatched_logs(&mut self, mut block: FakeBlock) -> FakeBlock {
@@ -830,6 +913,7 @@ impl LiveSource for FakeLiveSource {
         if self.records_log_filter(height) {
             self.log_block_hash_filters.push(block.header.hash);
         }
+        self.maybe_block_hash_log_not_found(&block)?;
         Ok(self.maybe_mismatched_logs(block))
     }
 
@@ -841,6 +925,7 @@ impl LiveSource for FakeLiveSource {
         if self.records_log_filter(block.header.height) {
             self.log_block_hash_filters.push(block.header.hash);
         }
+        self.maybe_block_hash_log_not_found(&block)?;
         Ok(self.maybe_mismatched_logs(block))
     }
 
@@ -864,6 +949,15 @@ impl LiveSource for FakeLiveSource {
             .logs
             .iter()
             .all(|log| log.block_hash == block.header.hash)
+    }
+
+    fn source_error_kind(error: &Self::Error) -> LiveSourceErrorKind {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("eth_getlogs blockhash") && lower.contains("block not found") {
+            LiveSourceErrorKind::Reconcile
+        } else {
+            LiveSourceErrorKind::Transient
+        }
     }
 
     fn verify_recent(
@@ -1207,6 +1301,7 @@ fn consume_scenario(scenario: &LiveScenario) -> usize {
             | LiveFault::ShorterForkAtCurrentHeight { height }
             | LiveFault::ReorgDuringCatchUp { at_height: height }
             | LiveFault::BlockHashLogMismatch { height }
+            | LiveFault::BlockHashLogsBlockNotFoundThenReorg { height }
             | LiveFault::ProviderDisagreement { height }
             | LiveFault::FinalizedBoundary {
                 finalized_height: height,

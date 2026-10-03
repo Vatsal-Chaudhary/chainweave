@@ -9,6 +9,9 @@ use crate::{ChainHead, RpcClient, RpcError};
 pub fn classify_rpc_error(error: &RpcError) -> RpcFailure {
     match error {
         RpcError::Request(message) => {
+            if is_hash_anchored_log_block_not_found(message) {
+                return RpcFailure::Permanent;
+            }
             let classified = RpcFailure::from_rpc_message(message);
             if matches!(classified, RpcFailure::Permanent) {
                 RpcFailure::Transient
@@ -18,6 +21,13 @@ pub fn classify_rpc_error(error: &RpcError) -> RpcFailure {
         }
         _ => RpcFailure::Permanent,
     }
+}
+
+fn is_hash_anchored_log_block_not_found(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("eth_getlogs")
+        && (lower.contains("blockhash") || lower.contains("block hash"))
+        && lower.contains("block not found")
 }
 
 /// Runs one RPC operation with the shared bounded retry and timeout policy.
@@ -115,4 +125,19 @@ pub async fn fetch_header_by_hash_with_retry(
         || client.fetch_header_by_hash(hash),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use chainweave_core::RpcFailure;
+
+    use super::{RpcError, classify_rpc_error};
+
+    #[test]
+    fn hash_anchored_log_block_not_found_is_not_retried() {
+        let error =
+            RpcError::Request("eth_getLogs blockHash 0xabc failed: block not found".to_owned());
+
+        assert_eq!(classify_rpc_error(&error), RpcFailure::Permanent);
+    }
 }

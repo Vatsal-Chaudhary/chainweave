@@ -17,5 +17,5 @@ pub use config::{
 };
 pub use live::{
     LiveConfig, LiveError, LiveHaltReason, LiveHeadEvent, LiveReadiness, LiveReport, LiveSink,
-    LiveSource, LiveTracker, VerifierStatus,
+    LiveSource, LiveSourceErrorKind, LiveTracker, VerifierStatus,
 };

@@ -322,7 +322,8 @@ impl RpcClient {
         filter: Option<ContractLogFilter>,
     ) -> Result<Vec<RawLog>, RpcError> {
         self.fetch_rpc_logs_by_block_hash(block_hash, filter)
-            .await?
+            .await
+            .map_err(|error| block_hash_log_error(block_hash, error))?
             .into_iter()
             .map(|log| raw_log_from_rpc_block_hash(log, block_hash))
             .collect()
@@ -432,6 +433,16 @@ impl RpcClient {
 
 fn request_error(error: impl std::fmt::Display) -> RpcError {
     RpcError::Request(error.to_string())
+}
+
+fn block_hash_log_error(block_hash: [u8; 32], error: RpcError) -> RpcError {
+    match error {
+        RpcError::Request(message) => RpcError::Request(format!(
+            "eth_getLogs blockHash {} failed: {message}",
+            B256::from(block_hash)
+        )),
+        error => error,
+    }
 }
 
 impl RpcClient {
