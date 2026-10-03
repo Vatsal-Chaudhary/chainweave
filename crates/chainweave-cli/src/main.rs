@@ -997,6 +997,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_defaults_backfill_workers_to_acceptance_limit() {
+        let cli = Cli::try_parse_from([
+            "chainweave",
+            "--rpc-url",
+            "http://127.0.0.1:8545",
+            "backfill",
+            "--from-block",
+            "100",
+            "--to-block",
+            "200",
+        ])
+        .unwrap();
+
+        let Command::Backfill { workers, .. } = cli.command else {
+            panic!("expected backfill command");
+        };
+
+        assert_eq!(workers, DEFAULT_BACKFILL_WORKERS);
+        assert_eq!(workers, 8);
+    }
+
+    #[test]
     fn cli_rejects_zero_backfill_workers() {
         let result = Cli::try_parse_from([
             "chainweave",
