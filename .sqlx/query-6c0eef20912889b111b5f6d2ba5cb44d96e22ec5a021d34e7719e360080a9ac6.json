@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO logs (\n                    chain_id, block_hash, block_number, transaction_index,\n                    log_index, tx_hash, address, topics, data, decoded_event,\n                    decoder_version\n                )\n                VALUES (($1::text)::numeric, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n                ON CONFLICT (chain_id, block_hash, log_index) DO UPDATE\n                SET decoded_event = CASE\n                        WHEN logs.block_number = EXCLUDED.block_number\n                         AND logs.transaction_index = EXCLUDED.transaction_index\n                         AND logs.tx_hash = EXCLUDED.tx_hash\n                         AND logs.address = EXCLUDED.address\n                         AND logs.topics = EXCLUDED.topics\n                         AND logs.data = EXCLUDED.data\n                        THEN COALESCE(EXCLUDED.decoded_event, logs.decoded_event)\n                        ELSE logs.decoded_event\n                    END,\n                    decoder_version = CASE\n                        WHEN logs.block_number = EXCLUDED.block_number\n                         AND logs.transaction_index = EXCLUDED.transaction_index\n                         AND logs.tx_hash = EXCLUDED.tx_hash\n                         AND logs.address = EXCLUDED.address\n                         AND logs.topics = EXCLUDED.topics\n                         AND logs.data = EXCLUDED.data\n                        THEN COALESCE(EXCLUDED.decoder_version, logs.decoder_version)\n                        ELSE logs.decoder_version\n                    END\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Int8",
+        "Int4",
+        "Int4",
+        "Bytea",
+        "Bytea",
+        "ByteaArray",
+        "Bytea",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6c0eef20912889b111b5f6d2ba5cb44d96e22ec5a021d34e7719e360080a9ac6"
+}

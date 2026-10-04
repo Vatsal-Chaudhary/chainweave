@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     panic::AssertUnwindSafe,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -16,8 +17,9 @@ use chainweave_rpc::{
     retry_rpc_request, spawn_new_heads_wakeup,
 };
 use chainweave_sink::{
-    DurableChainBatch, HealthState, IndexedBlock, LiveStatusSnapshot, ObservabilityError,
-    ObservabilityServer, PostgresBackfillCommitter, PostgresChainWriter, PostgresStateError,
+    AbiRegistry, DurableChainBatch, HealthState, IndexedBlock, LiveStatusSnapshot,
+    ObservabilityError, ObservabilityServer, PostgresBackfillCommitter, PostgresChainWriter,
+    PostgresStateError,
 };
 use futures::FutureExt;
 use thiserror::Error;
@@ -84,6 +86,7 @@ pub struct RuntimeLiveConfig {
     pub budget_window: Duration,
     pub budget_cost_units_per_window: u64,
     pub filter: Option<ContractLogFilter>,
+    pub abi_registry: Option<Arc<AbiRegistry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +167,7 @@ impl RpcLiveSource {
             },
         )
         .await?;
+        self.decode_block_logs(&mut block);
         Ok(block)
     }
 
@@ -180,14 +184,21 @@ impl RpcLiveSource {
             .record_or_backoff(RpcMethod::GetBlockByHash)
             .await?;
         self.budget.record_or_backoff(RpcMethod::GetLogs).await?;
-        retry_rpc_request(
+        let mut block = retry_rpc_request(
             self.config.retry_policy,
             self.config.rpc_timeout,
             || RpcError::Request(format!("timed out fetching block by hash {hash:?}")),
             || self.client.fetch_block_by_hash(hash),
         )
-        .await
-        .map_err(Into::into)
+        .await?;
+        self.decode_block_logs(&mut block);
+        Ok(block)
+    }
+
+    fn decode_block_logs(&self, block: &mut IndexedBlock) {
+        if let Some(registry) = &self.config.abi_registry {
+            registry.decode_logs_in_place(&mut block.logs);
+        }
     }
 
     /// Fetches one header by number through the shared retry policy.
@@ -520,6 +531,7 @@ pub async fn run_live(
         budget_window: options.budget_window,
         budget_cost_units_per_window: options.budget_cost_units_per_window,
         filter: None,
+        abi_registry: super::abi_registry_from_config(config).map_err(ConfigError::Invalid)?,
     };
     let (primary_redacted, verifier_redacted) = live_endpoint_labels(config);
     let health = HealthState::default();

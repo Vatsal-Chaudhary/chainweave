@@ -13,7 +13,7 @@ use chainweave_rpc::{
     AnchoredRawLog, ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
     classify_rpc_error, fetch_header_by_number_with_retry,
 };
-use chainweave_sink::{IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter};
+use chainweave_sink::{AbiRegistry, IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter};
 use clap::{Parser, Subcommand};
 use tokio::task::JoinSet;
 use tracing::info;
@@ -177,12 +177,30 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+pub(crate) fn abi_registry_from_config(
+    config: &AppConfig,
+) -> std::result::Result<Option<Arc<AbiRegistry>>, String> {
+    if !config.abi.enabled || config.abi.contracts.is_empty() {
+        return Ok(None);
+    }
+    let registry = AbiRegistry::from_config_entries(config.abi.contracts.iter().map(|contract| {
+        (
+            contract.address.as_str(),
+            contract.standard.as_str(),
+            contract.decoder_version.as_deref(),
+        )
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(Some(Arc::new(registry)))
+}
+
 #[derive(Debug, Clone)]
 struct AdaptiveFetchConfig {
     workers: usize,
     retry_policy: RetryPolicy,
     rpc_timeout: Duration,
     filter: Option<ContractLogFilter>,
+    abi_registry: Option<Arc<AbiRegistry>>,
     budget: SharedRpcBudget,
 }
 
@@ -354,6 +372,7 @@ async fn run_backfill(config: &AppConfig, options: BackfillOptions) -> Result<()
         retry_policy,
         rpc_timeout: options.rpc_timeout,
         filter: contract_filter,
+        abi_registry: abi_registry_from_config(config).map_err(|error| anyhow!(error))?,
         budget: budget.clone(),
     };
     let report = fetch_and_commit_ranges(
@@ -664,6 +683,9 @@ async fn fetch_range_with_retry(
             }
         }
         block.logs = logs.into_iter().map(|log| log.raw).collect();
+        if let Some(registry) = &config.abi_registry {
+            registry.decode_logs_in_place(&mut block.logs);
+        }
         headers.push(header);
     }
     FetchedRange::new(range, headers, blocks).map_err(FetchRangeError::Backfill)
@@ -777,6 +799,7 @@ async fn fetch_reference_range_with_retry(
         retry_policy,
         rpc_timeout,
         filter,
+        abi_registry: None,
         budget: budget.clone(),
     };
     let logs = fetch_logs_with_retry(client, range, &config).await?;
@@ -1090,6 +1113,7 @@ mod tests {
             .unwrap(),
             rpc_timeout: Duration::from_secs(1),
             filter: None,
+            abi_registry: None,
             budget,
         };
         let full_range = BackfillRange::new(1, 4).unwrap();
@@ -1140,6 +1164,7 @@ mod tests {
             .unwrap(),
             rpc_timeout: Duration::from_secs(1),
             filter: None,
+            abi_registry: None,
             budget,
         };
         let full_range = BackfillRange::new(1, 4).unwrap();

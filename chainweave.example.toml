@@ -8,6 +8,16 @@ max_reorg_depth = 2048
 # safe_depth = 12
 # finalized_depth = 64
 
+[abi]
+enabled = false
+
+# Register contract addresses against bundled decoders. Decoding updates the
+# existing decoded_event/decoder_version columns; raw logs remain retained.
+# [[abi.contracts]]
+# address = "0x0000000000000000000000000000000000000000"
+# standard = "erc20" # erc20, erc721, or uniswap_v3_pool
+# decoder_version = "erc20:v1"
+
 [queues]
 fetch = 128
 coordinate = 64

@@ -14,6 +14,7 @@ const ENV_PREFIX: &str = "CHAINWEAVE_";
 pub struct AppConfig {
     pub rpc: RpcConfig,
     pub indexer: IndexerConfig,
+    pub abi: AbiConfig,
     pub server: ServerConfig,
     pub database_url: Option<String>,
     pub kafka_brokers: Option<Vec<String>>,
@@ -32,6 +33,19 @@ pub struct IndexerConfig {
     pub max_reorg_depth: u64,
     pub safe_depth: Option<u64>,
     pub finalized_depth: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AbiConfig {
+    pub enabled: bool,
+    pub contracts: Vec<AbiContractConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AbiContractConfig {
+    pub address: String,
+    pub standard: String,
+    pub decoder_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,6 +92,7 @@ impl Default for AppConfig {
                 safe_depth: None,
                 finalized_depth: None,
             },
+            abi: AbiConfig::default(),
             server: ServerConfig {
                 listen_addr: "127.0.0.1:9100".parse().expect("default address is valid"),
             },
@@ -146,6 +161,7 @@ impl AppConfig {
             }
             validate_hash(&identity.genesis_hash)?;
         }
+        validate_abi_config(&self.abi)?;
 
         if profile == ValidationProfile::Workers {
             let database_url = self
@@ -283,6 +299,42 @@ fn validate_hash(value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_abi_config(config: &AbiConfig) -> Result<(), ConfigError> {
+    for contract in &config.contracts {
+        validate_address(&contract.address)?;
+        validate_abi_standard(&contract.standard)?;
+        if let Some(version) = &contract.decoder_version
+            && version.trim().is_empty()
+        {
+            return Err(invalid("abi.contracts.decoder_version must not be empty"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_address(value: &str) -> Result<(), ConfigError> {
+    let bytes = value.strip_prefix("0x").unwrap_or(value);
+    if bytes.len() != 40 || !bytes.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("abi.contracts.address must be a 20-byte hex value"));
+    }
+    Ok(())
+}
+
+fn validate_abi_standard(value: &str) -> Result<(), ConfigError> {
+    match value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
+        "erc20" | "erc_20" | "erc721" | "erc_721" | "uniswap_v3" | "uniswap_v3_pool"
+        | "uniswapv3pool" => Ok(()),
+        _ => Err(invalid(
+            "abi.contracts.standard must be erc20, erc721, or uniswap_v3_pool",
+        )),
+    }
+}
+
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
@@ -346,6 +398,26 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate(ValidationProfile::Head).is_err());
+    }
+
+    #[test]
+    fn validates_abi_registry_entries() {
+        let mut config = AppConfig {
+            abi: AbiConfig {
+                enabled: true,
+                contracts: vec![AbiContractConfig {
+                    address: "0x1111111111111111111111111111111111111111".to_owned(),
+                    standard: "erc20".to_owned(),
+                    decoder_version: Some("erc20:v1".to_owned()),
+                }],
+            },
+            ..AppConfig::default()
+        };
+        config.validate(ValidationProfile::Head).unwrap();
+
+        config.abi.contracts[0].standard = "nonsense".to_owned();
+        let error = config.validate(ValidationProfile::Head).unwrap_err();
+        assert!(error.to_string().contains("abi.contracts.standard"));
     }
 
     #[test]

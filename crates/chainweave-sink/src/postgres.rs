@@ -18,6 +18,8 @@ use tokio::{sync::mpsc, time::timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, warn};
 
+use crate::{AbiRegistry, DecodeReport};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockStatus {
     Unsafe,
@@ -95,6 +97,13 @@ pub struct OutboxEvent {
     pub event_kind: String,
     pub block_hash: BlockHash,
     pub block_height: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RedecodeReport {
+    pub scanned_logs: usize,
+    pub updated_logs: usize,
+    pub decode: DecodeReport,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +202,18 @@ pub struct SerializedWriter {
 }
 
 struct RawLogRow {
+    transaction_index: i32,
+    log_index: i32,
+    tx_hash: Vec<u8>,
+    address: Vec<u8>,
+    topics: Vec<Vec<u8>>,
+    data: Vec<u8>,
+    decoded_event: Option<Value>,
+    decoder_version: Option<String>,
+}
+
+struct RetainedRawLogRow {
+    block_hash: Vec<u8>,
     transaction_index: i32,
     log_index: i32,
     tx_hash: Vec<u8>,
@@ -546,14 +567,26 @@ impl PostgresChainWriter {
                 )
                 VALUES (($1::text)::numeric, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (chain_id, block_hash, log_index) DO UPDATE
-                SET block_number = EXCLUDED.block_number,
-                    transaction_index = EXCLUDED.transaction_index,
-                    tx_hash = EXCLUDED.tx_hash,
-                    address = EXCLUDED.address,
-                    topics = EXCLUDED.topics,
-                    data = EXCLUDED.data,
-                    decoded_event = EXCLUDED.decoded_event,
-                    decoder_version = EXCLUDED.decoder_version
+                SET decoded_event = CASE
+                        WHEN logs.block_number = EXCLUDED.block_number
+                         AND logs.transaction_index = EXCLUDED.transaction_index
+                         AND logs.tx_hash = EXCLUDED.tx_hash
+                         AND logs.address = EXCLUDED.address
+                         AND logs.topics = EXCLUDED.topics
+                         AND logs.data = EXCLUDED.data
+                        THEN COALESCE(EXCLUDED.decoded_event, logs.decoded_event)
+                        ELSE logs.decoded_event
+                    END,
+                    decoder_version = CASE
+                        WHEN logs.block_number = EXCLUDED.block_number
+                         AND logs.transaction_index = EXCLUDED.transaction_index
+                         AND logs.tx_hash = EXCLUDED.tx_hash
+                         AND logs.address = EXCLUDED.address
+                         AND logs.topics = EXCLUDED.topics
+                         AND logs.data = EXCLUDED.data
+                        THEN COALESCE(EXCLUDED.decoder_version, logs.decoder_version)
+                        ELSE logs.decoder_version
+                    END
                 ",
                 &self.chain_id,
                 hash_bytes(&block.header.hash),
@@ -572,6 +605,85 @@ impl PostgresChainWriter {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Re-decodes retained raw logs and updates only versioned decoder columns.
+    ///
+    /// Raw identity and payload fields remain untouched; no outbox rows are appended or mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error or invalid stored byte lengths.
+    pub async fn redecode_retained_logs(
+        &self,
+        registry: &AbiRegistry,
+    ) -> Result<RedecodeReport, PostgresStateError> {
+        let rows = sqlx::query_as!(
+            RetainedRawLogRow,
+            r"
+            SELECT
+                logs.block_hash,
+                logs.transaction_index,
+                logs.log_index,
+                logs.tx_hash,
+                logs.address,
+                logs.topics,
+                logs.data,
+                logs.decoded_event,
+                logs.decoder_version
+            FROM logs
+            WHERE logs.chain_id = ($1::text)::numeric
+            ORDER BY logs.block_number, logs.transaction_index, logs.log_index
+            ",
+            &self.chain_id,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut report = RedecodeReport {
+            scanned_logs: rows.len(),
+            ..RedecodeReport::default()
+        };
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            let block_hash = hash_from_vec(row.block_hash)?;
+            let mut log = row_to_raw_log(RawLogRow {
+                transaction_index: row.transaction_index,
+                log_index: row.log_index,
+                tx_hash: row.tx_hash,
+                address: row.address,
+                topics: row.topics,
+                data: row.data,
+                decoded_event: row.decoded_event,
+                decoder_version: row.decoder_version,
+            })?;
+            report.decode.record(registry.decode_log_in_place(&mut log));
+
+            let result = sqlx::query!(
+                r"
+                UPDATE logs
+                SET decoded_event = $4,
+                    decoder_version = $5
+                WHERE chain_id = ($1::text)::numeric
+                  AND block_hash = $2
+                  AND log_index = $3
+                  AND (
+                        decoded_event IS DISTINCT FROM $4
+                     OR decoder_version IS DISTINCT FROM $5
+                  )
+                ",
+                &self.chain_id,
+                hash_bytes(&block_hash),
+                pg_int(log.log_index)?,
+                log.decoded_event,
+                log.decoder_version.as_deref(),
+            )
+            .execute(tx.as_mut())
+            .await?;
+            report.updated_logs += usize::try_from(result.rows_affected()).unwrap_or(usize::MAX);
+        }
+        tx.commit().await?;
+        Ok(report)
     }
 
     async fn append_outbox(
@@ -1332,6 +1444,8 @@ fn hex_hash(hash: &BlockHash) -> String {
 mod tests {
     use std::{env, process::Command, str::FromStr as _, time::Duration};
 
+    use crate::{AbiRegistryEntry, AbiStandard};
+    use alloy::{json_abi::Event, primitives::U256};
     use chainweave_core::{
         AsyncRangeCommitSink, BackfillRange, BlockHeader, ChainBatch, ChainTransition, LiveConfig,
         LiveSink, LiveSource, LiveTracker, OrderedCommitCoordinator, RangeCommitSink, RetryPolicy,
@@ -1382,6 +1496,101 @@ mod tests {
         assert_eq!(first_logs.len(), 3);
         assert_eq!(first_outbox.len(), 3);
         assert_checkpoint_references_canonical_block(&db.writer).await;
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn redecode_updates_only_decoder_columns_and_preserves_raw_log_identity() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        let mut block = block(0, 0);
+        block.logs[0] = erc20_transfer_log("stale:v0");
+        db.writer.apply_batch(&batch(None, [block])).await.unwrap();
+
+        let before_raw = db.writer.canonical_log_records(0, 0, None).await.unwrap();
+        let before_logs = db.writer.canonical_logs().await.unwrap();
+        assert_eq!(before_logs[0].decoder_version.as_deref(), Some("stale:v0"));
+
+        let registry = AbiRegistry::new([AbiRegistryEntry {
+            address: [0x20; 20],
+            standard: AbiStandard::Erc20,
+            decoder_version: "erc20:v2".to_owned(),
+        }])
+        .unwrap();
+        let report = db.writer.redecode_retained_logs(&registry).await.unwrap();
+
+        assert_eq!(report.scanned_logs, 1);
+        assert_eq!(report.updated_logs, 1);
+        assert_eq!(report.decode.decoded, 1);
+        assert_eq!(
+            db.writer.canonical_log_records(0, 0, None).await.unwrap(),
+            before_raw
+        );
+        let after_logs = db.writer.canonical_logs().await.unwrap();
+        assert_eq!(after_logs[0].topics, before_logs[0].topics);
+        assert_eq!(after_logs[0].data, before_logs[0].data);
+        assert_eq!(after_logs[0].tx_hash, before_logs[0].tx_hash);
+        assert_eq!(after_logs[0].address, before_logs[0].address);
+        assert_eq!(after_logs[0].decoder_version.as_deref(), Some("erc20:v2"));
+        assert_eq!(
+            after_logs[0].decoded_event.as_ref().unwrap()["args"]["value"],
+            "1000"
+        );
+        assert_eq!(db.writer.outbox_events().await.unwrap().len(), 1);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn log_conflict_updates_decoder_columns_only_when_raw_fields_match() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        let mut block = block(0, 0);
+        block.logs[0].data = vec![0x01];
+        block.logs[0].decoded_event = Some(json!({"source": "stored"}));
+        block.logs[0].decoder_version = Some("stored:v1".to_owned());
+        db.writer
+            .apply_batch(&batch(None, [block.clone()]))
+            .await
+            .unwrap();
+
+        let mut divergent = block.clone();
+        divergent.logs[0].data = vec![0x02];
+        divergent.logs[0].decoded_event = Some(json!({"source": "divergent"}));
+        divergent.logs[0].decoder_version = Some("divergent:v1".to_owned());
+        db.writer
+            .apply_batch(&batch(None, [divergent]))
+            .await
+            .unwrap();
+
+        let after_divergent = db.writer.canonical_logs().await.unwrap();
+        assert_eq!(after_divergent[0].data, vec![0x01]);
+        assert_eq!(
+            after_divergent[0].decoded_event,
+            Some(json!({"source": "stored"}))
+        );
+        assert_eq!(
+            after_divergent[0].decoder_version.as_deref(),
+            Some("stored:v1")
+        );
+
+        block.logs[0].decoded_event = Some(json!({"source": "same-raw"}));
+        block.logs[0].decoder_version = Some("same-raw:v2".to_owned());
+        db.writer.apply_batch(&batch(None, [block])).await.unwrap();
+
+        let after_matching = db.writer.canonical_logs().await.unwrap();
+        assert_eq!(after_matching[0].data, vec![0x01]);
+        assert_eq!(
+            after_matching[0].decoded_event,
+            Some(json!({"source": "same-raw"}))
+        );
+        assert_eq!(
+            after_matching[0].decoder_version.as_deref(),
+            Some("same-raw:v2")
+        );
         db.cleanup().await;
     }
 
@@ -2378,5 +2587,33 @@ mod tests {
 
     fn hash(value: u8) -> BlockHash {
         [value; 32]
+    }
+
+    fn erc20_transfer_log(decoder_version: &str) -> RawLog {
+        RawLog {
+            transaction_index: 0,
+            log_index: 0,
+            tx_hash: hash(40),
+            address: [0x20; 20],
+            topics: vec![
+                Event::parse(
+                    "event Transfer(address indexed from,address indexed to,uint256 value)",
+                )
+                .unwrap()
+                .selector()
+                .0,
+                topic_address([0x11; 20]),
+                topic_address([0x22; 20]),
+            ],
+            data: U256::from(1_000_u64).to_be_bytes::<32>().to_vec(),
+            decoded_event: Some(json!({"stale": true})),
+            decoder_version: Some(decoder_version.to_owned()),
+        }
+    }
+
+    fn topic_address(address: [u8; 20]) -> BlockHash {
+        let mut topic = [0_u8; 32];
+        topic[12..].copy_from_slice(&address);
+        topic
     }
 }

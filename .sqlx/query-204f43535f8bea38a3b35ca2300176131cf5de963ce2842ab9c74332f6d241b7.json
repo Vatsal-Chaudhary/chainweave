@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE logs\n                SET decoded_event = $4,\n                    decoder_version = $5\n                WHERE chain_id = ($1::text)::numeric\n                  AND block_hash = $2\n                  AND log_index = $3\n                  AND (\n                        decoded_event IS DISTINCT FROM $4\n                     OR decoder_version IS DISTINCT FROM $5\n                  )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Int4",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "204f43535f8bea38a3b35ca2300176131cf5de963ce2842ab9c74332f6d241b7"
+}

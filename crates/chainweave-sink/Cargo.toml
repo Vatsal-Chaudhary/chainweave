@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+alloy.workspace = true
 axum.workspace = true
 chainweave-core = { path = "../chainweave-core" }
 metrics.workspace = true

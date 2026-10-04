@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.94.1"
 
 [workspace.dependencies]
-alloy = { version = "2.3.0", default-features = false, features = ["provider-http", "provider-ws", "reqwest-rustls-tls", "rpc-types"] }
+alloy = { version = "2.3.0", default-features = false, features = ["dyn-abi", "json-abi", "provider-http", "provider-ws", "reqwest-rustls-tls", "rpc-types"] }
 anyhow = "1.0.100"
 axum = "0.8.8"
 clap = { version = "4.5.54", features = ["derive", "env"] }

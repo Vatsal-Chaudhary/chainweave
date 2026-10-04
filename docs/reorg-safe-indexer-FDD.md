@@ -263,6 +263,7 @@ Each milestone should ship with tests and a short demo (CLI output / log trace) 
 - Keep protocol output in the existing versioned `decoded_event` JSONB representation for v1; do not add protocol-specific relational tables or schema migrations
 - Unknown ABI/signature and decode failures retain raw data and produce metrics instead of blocking canonical ingestion
 - Versioned re-decoding can update `decoded_event` without refetching RPC data and without changing raw log identity
+- Already-emitted outbox events are not silently mutated or retracted when ABI versions change; downstream correction or re-decode event policy is deferred to later Kafka/consumer milestones.
 - **Acceptance:** feed pinned ERC-20, ERC-721, and Uniswap V3 raw-log fixtures and assert decoded fields and within-block order. Verify that address/ABI registration resolves standards with overlapping event signatures. Change the ABI version, re-decode, and verify raw topics/data remain unchanged.
 
 ### M6 — Kafka Outbox Delivery
