@@ -30,10 +30,24 @@ if ! command -v psql >/dev/null 2>&1; then
   printf 'psql is required\n' >&2
   exit 127
 fi
-if ! command -v cast >/dev/null 2>&1; then
-  printf 'cast is required for RPC hash comparison\n' >&2
+if ! command -v curl >/dev/null 2>&1; then
+  printf 'curl is required for RPC hash comparison\n' >&2
   exit 127
 fi
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'jq is required for RPC hash comparison\n' >&2
+  exit 127
+fi
+
+rpc_block_hash() {
+  local height="$1"
+  local height_hex
+  height_hex="$(printf '0x%x' "$height")"
+  curl -fsS \
+    -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"${height_hex}\",false]}" \
+    "$LIVE_PRIMARY_HTTP_URL" | jq -r '.result.hash'
+}
 
 psql "$DATABASE_URL" -v chain_id="$EXPECTED_CHAIN_ID" <<'SQL'
 \set ON_ERROR_STOP on
@@ -117,7 +131,7 @@ mismatches=0
 checked=0
 while IFS='|' read -r height db_hash; do
   [[ -z "$height" ]] && continue
-  rpc_hash="$(cast block "$height" hash --rpc-url "$LIVE_PRIMARY_HTTP_URL")"
+  rpc_hash="$(rpc_block_hash "$height")"
   checked=$((checked + 1))
   if [[ "${db_hash,,}" != "${rpc_hash,,}" ]]; then
     printf 'hash mismatch height=%s db=%s rpc=%s\n' "$height" "$db_hash" "$rpc_hash" >&2
