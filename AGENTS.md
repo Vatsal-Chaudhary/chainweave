@@ -1,10 +1,12 @@
 # AGENTS.md — chainweave
 
-Rules for any AI agent (Claude Code, Codex, OpenCode, etc.) working in this repo. The authoritative spec is `docs/reorg-safe-indexer-FDD.md` — read it before touching code, and re-read the relevant milestone section before starting that milestone.
+Rules for any AI agent (Claude Code, Codex, OpenCode, etc.) working in this repo. The authoritative spec is `docs/reorg-safe-indexer-FDD-v2.md` — read it before touching code, and re-read the relevant milestone section before starting that milestone.
+
+Active spec: reorg-safe-indexer-FDD-v2.md. The original reorg-safe-indexer-FDD.md is archived full scope; only use it if the user explicitly says to point back to the original.
 
 ## 1. Source of truth & scope discipline
 
-- `docs/reorg-safe-indexer-FDD.md` is the spec. If code and FDD disagree, stop and flag it — don't silently pick one. If a design decision in the FDD turns out to be wrong once you're implementing it, propose the change and update the FDD in the same PR/commit as the code change. The FDD must never drift out of sync with reality.
+- `docs/reorg-safe-indexer-FDD-v2.md` is the spec. If code and FDD disagree, stop and flag it — don't silently pick one. If a design decision in the FDD turns out to be wrong once you're implementing it, propose the change and update the FDD in the same PR/commit as the code change. The FDD must never drift out of sync with reality.
 - Work one milestone at a time, in order (M0 → M10). Do not start M(n+1) work, scaffolding, or dependencies until M(n)'s acceptance criteria are met and I've confirmed it.
 - Do not add scope the FDD didn't ask for (extra chains, extra endpoints, extra crates) without asking first, even if it seems like a natural improvement. Flag it as a suggestion instead of just building it.
 - If a milestone looks bigger than it should once you're inside it, say so and propose a split — don't quietly cut corners to make it fit.
