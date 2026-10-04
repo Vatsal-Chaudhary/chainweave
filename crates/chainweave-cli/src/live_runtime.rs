@@ -634,10 +634,14 @@ pub async fn run_live(
         ),
     );
 
-    match tokio::time::timeout(options.shutdown_timeout, supervisor.run_until_first_exit()).await {
-        Ok(result) => result.map_err(Into::into),
-        Err(_) => Err(LiveRuntimeError::Task(LiveTaskError::SupervisorCancelled)),
-    }
+    run_live_supervisor(supervisor, options.shutdown_timeout).await
+}
+
+async fn run_live_supervisor(
+    supervisor: LiveTaskSupervisor,
+    _shutdown_timeout: Duration,
+) -> Result<(), LiveRuntimeError> {
+    supervisor.run_until_first_exit().await.map_err(Into::into)
 }
 
 #[derive(Debug, Clone)]
@@ -1998,5 +2002,31 @@ mod tests {
             Err(LiveTaskError::TaskExitedEarly(LiveTask::Poll))
         );
         assert_eq!(sibling_cancelled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn live_supervisor_does_not_use_shutdown_timeout_as_runtime_deadline() {
+        let shutdown = CancellationToken::new();
+        let mut supervisor = LiveTaskSupervisor::new(shutdown.clone());
+        let poll_shutdown = shutdown.clone();
+        let tracker_shutdown = shutdown.clone();
+
+        supervisor.spawn(LiveTask::Poll, async move {
+            poll_shutdown.cancelled().await;
+            Ok(())
+        });
+        supervisor.spawn(LiveTask::Tracker, async move {
+            tracker_shutdown.cancelled().await;
+            Ok(())
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(25),
+            run_live_supervisor(supervisor, Duration::from_millis(1)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        shutdown.cancel();
     }
 }
