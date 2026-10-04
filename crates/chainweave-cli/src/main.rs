@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{net::SocketAddr, path::PathBuf};
@@ -13,9 +13,17 @@ use chainweave_rpc::{
     AnchoredRawLog, ContractLogFilter, RpcClient, RpcError, capture_target_head_with_retry,
     classify_rpc_error, fetch_header_by_number_with_retry,
 };
-use chainweave_sink::{AbiRegistry, IndexedBlock, PostgresBackfillCommitter, PostgresChainWriter};
+use chainweave_sink::{
+    AbiRegistry, IndexedBlock, KafkaDispatcherConfig, KafkaOutboxDispatcher,
+    PostgresBackfillCommitter, PostgresChainWriter, render_demo_consumer_event,
+};
 use clap::{Parser, Subcommand};
+use rdkafka::{
+    ClientConfig, Message,
+    consumer::{CommitMode, Consumer, StreamConsumer},
+};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -87,6 +95,13 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         shutdown_timeout_ms: u64,
     },
+    /// Publish committed Postgres outbox rows to Kafka in event_id order.
+    KafkaDispatch,
+    /// Print a deduplicated demo view of Kafka outbox transition events.
+    KafkaDemoConsumer {
+        #[arg(long)]
+        max_messages: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -147,6 +162,10 @@ async fn main() -> Result<()> {
             live_runtime::run_live(&config, options)
                 .await
                 .map_err(Into::into)
+        }
+        Command::KafkaDispatch => run_kafka_dispatcher(&config).await,
+        Command::KafkaDemoConsumer { max_messages } => {
+            run_kafka_demo_consumer(&config, max_messages).await
         }
     }
 }
@@ -516,6 +535,93 @@ async fn run_backfill(config: &AppConfig, options: BackfillOptions) -> Result<()
         usage.requests, usage.cost_units, rpc_calls_per_1k_blocks
     );
     Ok(())
+}
+
+async fn run_kafka_dispatcher(config: &AppConfig) -> Result<()> {
+    config
+        .validate(ValidationProfile::Workers)
+        .context("configuration validation failed")?;
+    let database_url = config
+        .database_url
+        .as_deref()
+        .context("database_url is required before running the Kafka dispatcher")?;
+    let dispatcher_config = kafka_dispatcher_config(config)?;
+    let dispatcher = KafkaOutboxDispatcher::connect_database(database_url, dispatcher_config)
+        .await
+        .context("failed to start Kafka outbox dispatcher")?;
+    let cancel = CancellationToken::new();
+    let shutdown = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %error, "failed to listen for ctrl-c");
+        }
+        shutdown.cancel();
+    });
+    dispatcher.run_until_cancelled(cancel).await?;
+    Ok(())
+}
+
+async fn run_kafka_demo_consumer(config: &AppConfig, max_messages: Option<usize>) -> Result<()> {
+    config
+        .validate(ValidationProfile::Kafka)
+        .context("configuration validation failed")?;
+    let brokers = config.kafka_brokers();
+    if brokers.is_empty() {
+        bail!("kafka.brokers is required before running the demo consumer");
+    }
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers.join(","))
+        .set("group.id", &config.kafka.consumer_group)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .context("failed to create Kafka demo consumer")?;
+    consumer
+        .subscribe(&[&config.kafka.outbox_topic])
+        .context("failed to subscribe to outbox topic")?;
+
+    let mut seen = BTreeSet::new();
+    loop {
+        if max_messages.is_some_and(|limit| seen.len() >= limit) {
+            return Ok(());
+        }
+        let message = consumer
+            .recv()
+            .await
+            .context("Kafka consumer receive failed")?;
+        let Some(payload) = message.payload() else {
+            consumer
+                .commit_message(&message, CommitMode::Sync)
+                .context("failed to commit empty Kafka message")?;
+            continue;
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(payload).context("failed to decode Kafka outbox JSON")?;
+        let event_id = value
+            .get("event_id")
+            .and_then(serde_json::Value::as_i64)
+            .context("Kafka outbox message is missing event_id")?;
+        if seen.insert(event_id) {
+            println!("{}", render_demo_consumer_event(&value));
+        }
+        consumer
+            .commit_message(&message, CommitMode::Sync)
+            .context("failed to commit Kafka offset")?;
+    }
+}
+
+fn kafka_dispatcher_config(config: &AppConfig) -> Result<KafkaDispatcherConfig> {
+    let brokers = config.kafka_brokers().to_vec();
+    if brokers.is_empty() {
+        bail!("kafka.brokers is required before running the Kafka dispatcher");
+    }
+    Ok(KafkaDispatcherConfig::new(
+        brokers,
+        config.kafka.outbox_topic.clone(),
+        config.kafka.queue_buffering_max_messages,
+        Duration::from_millis(config.kafka.delivery_timeout_ms),
+        Duration::from_millis(config.kafka.dispatcher_poll_ms),
+    ))
 }
 
 async fn fetch_and_commit_ranges(

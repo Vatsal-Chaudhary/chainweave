@@ -1,6 +1,6 @@
 # chainweave
 
-A reorg-safe EVM chain indexer in Rust. The project is being delivered incrementally from the [FDD](docs/reorg-safe-indexer-FDD.md); the current baseline establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, observability primitives, and transactional Postgres state for canonical blocks/logs/checkpoints/outbox rows.
+A reorg-safe EVM chain indexer in Rust. The project is being delivered incrementally from the [FDD](docs/reorg-safe-indexer-FDD.md); the current baseline establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, observability primitives, transactional Postgres state for canonical blocks/logs/checkpoints/outbox rows, and at-least-once Kafka outbox delivery.
 
 ## Quickstart
 
@@ -61,7 +61,7 @@ canonical continuity: 50000 blocks from 11594001 through 11644000
 RPC budget used: 51001 requests / 55001 cost units (1020.02 calls per 1k blocks)
 ```
 
-This remains bounded historical backfill work only. Live streaming, websocket subscriptions, live wakeups, ABI decoding, Kafka delivery, and production metrics are later milestones.
+This remains bounded historical backfill work only. Live streaming, websocket subscriptions, live wakeups, ABI decoding, and Kafka delivery are available in later milestone slices; production metrics are a later milestone.
 
 ## Tests
 
@@ -108,9 +108,26 @@ CHAINWEAVE_TESTNET_RPC_URL=https://YOUR_TESTNET_RPC \
 
 The `chainweave-sink` crate provides fail-closed `/health` and `/ready` state plus a Prometheus `/metrics` handler. A long-running worker process will bind these in a later increment; the current baseline establishes and tests the server primitive and the durable Postgres writer.
 
+## Kafka Outbox Delivery
+
+`chainweave kafka-dispatch` publishes committed unpublished `outbox_events` rows one at a time in `event_id` order. It marks `published_at` only after Kafka broker acknowledgement, so a crash after acknowledgement can retry the same row with the same stable `event_id`. Kafka keys are chain-scoped for partition ordering; `event_id` is carried in headers and payload for downstream deduplication.
+
+```bash
+CHAINWEAVE_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+CHAINWEAVE_KAFKA__BROKERS='["127.0.0.1:9092"]' \
+cargo run -p chainweave-cli -- kafka-dispatch
+```
+
+The demo consumer commits Kafka offsets and prints a deduplicated view by `event_id`:
+
+```bash
+CHAINWEAVE_KAFKA__BROKERS='["127.0.0.1:9092"]' \
+cargo run -p chainweave-cli -- kafka-demo-consumer
+```
+
 ## Reorg flow
 
-The current transition module proves ancestry and emits ordered canonicality transitions. The Postgres writer now persists those transitions atomically into canonical block state, raw logs, checkpoint, and durable outbox rows; Kafka delivery remains a later increment.
+The current transition module proves ancestry and emits ordered canonicality transitions. The Postgres writer persists those transitions atomically into canonical block state, raw logs, checkpoint, and durable outbox rows; the Kafka dispatcher publishes committed outbox rows at least once with stable `event_id`s for downstream deduplication.
 
 ```mermaid
 flowchart TD

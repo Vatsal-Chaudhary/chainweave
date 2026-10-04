@@ -15,8 +15,10 @@ pub struct AppConfig {
     pub rpc: RpcConfig,
     pub indexer: IndexerConfig,
     pub abi: AbiConfig,
+    pub kafka: KafkaConfig,
     pub server: ServerConfig,
     pub database_url: Option<String>,
+    /// Compatibility shim for the original top-level Kafka broker setting.
     pub kafka_brokers: Option<Vec<String>>,
     pub expected_chain: Option<ChainIdentity>,
 }
@@ -49,6 +51,16 @@ pub struct AbiContractConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KafkaConfig {
+    pub brokers: Vec<String>,
+    pub outbox_topic: String,
+    pub consumer_group: String,
+    pub queue_buffering_max_messages: usize,
+    pub delivery_timeout_ms: u64,
+    pub dispatcher_poll_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
 }
@@ -62,6 +74,7 @@ pub struct ChainIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationProfile {
     Head,
+    Kafka,
     Workers,
 }
 
@@ -93,6 +106,14 @@ impl Default for AppConfig {
                 finalized_depth: None,
             },
             abi: AbiConfig::default(),
+            kafka: KafkaConfig {
+                brokers: Vec::new(),
+                outbox_topic: "chainweave.outbox".to_owned(),
+                consumer_group: "chainweave-demo-consumer".to_owned(),
+                queue_buffering_max_messages: 10_000,
+                delivery_timeout_ms: 30_000,
+                dispatcher_poll_ms: 1_000,
+            },
             server: ServerConfig {
                 listen_addr: "127.0.0.1:9100".parse().expect("default address is valid"),
             },
@@ -170,15 +191,24 @@ impl AppConfig {
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| invalid("database_url is required before starting workers"))?;
             validate_database_url(database_url)?;
+        }
 
-            if let Some(brokers) = &self.kafka_brokers
-                && (brokers.is_empty() || brokers.iter().any(|broker| broker.trim().is_empty()))
-            {
-                return Err(invalid("kafka_brokers must not contain empty entries"));
-            }
+        if matches!(
+            profile,
+            ValidationProfile::Kafka | ValidationProfile::Workers
+        ) {
+            validate_kafka_config(self)?;
         }
 
         Ok(())
+    }
+
+    #[must_use]
+    pub fn kafka_brokers(&self) -> &[String] {
+        self.kafka_brokers
+            .as_deref()
+            .filter(|brokers| !brokers.is_empty())
+            .unwrap_or(&self.kafka.brokers)
     }
 
     /// Validates live-worker settings that cannot be inferred from the general worker profile.
@@ -312,6 +342,31 @@ fn validate_abi_config(config: &AbiConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_kafka_config(config: &AppConfig) -> Result<(), ConfigError> {
+    let brokers = config.kafka_brokers();
+    if brokers.iter().any(|broker| broker.trim().is_empty()) {
+        return Err(invalid("kafka brokers must not contain empty entries"));
+    }
+    if config.kafka.outbox_topic.trim().is_empty() {
+        return Err(invalid("kafka.outbox_topic must not be empty"));
+    }
+    if config.kafka.consumer_group.trim().is_empty() {
+        return Err(invalid("kafka.consumer_group must not be empty"));
+    }
+    if config.kafka.queue_buffering_max_messages == 0 {
+        return Err(invalid(
+            "kafka.queue_buffering_max_messages must be nonzero",
+        ));
+    }
+    if config.kafka.delivery_timeout_ms == 0 {
+        return Err(invalid("kafka.delivery_timeout_ms must be nonzero"));
+    }
+    if config.kafka.dispatcher_poll_ms == 0 {
+        return Err(invalid("kafka.dispatcher_poll_ms must be nonzero"));
+    }
+    Ok(())
+}
+
 fn validate_address(value: &str) -> Result<(), ConfigError> {
     let bytes = value.strip_prefix("0x").unwrap_or(value);
     if bytes.len() != 40 || !bytes.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -418,6 +473,23 @@ mod tests {
         config.abi.contracts[0].standard = "nonsense".to_owned();
         let error = config.validate(ValidationProfile::Head).unwrap_err();
         assert!(error.to_string().contains("abi.contracts.standard"));
+    }
+
+    #[test]
+    fn validates_minimal_kafka_config() {
+        let mut config = AppConfig {
+            database_url: Some("postgresql://vatsal@localhost/postgres?host=/tmp".to_owned()),
+            ..AppConfig::default()
+        };
+        config.validate(ValidationProfile::Workers).unwrap();
+
+        config.kafka.brokers = vec!["127.0.0.1:9092".to_owned()];
+        config.kafka.outbox_topic = "chainweave.outbox".to_owned();
+        config.validate(ValidationProfile::Workers).unwrap();
+
+        config.kafka.queue_buffering_max_messages = 0;
+        let error = config.validate(ValidationProfile::Workers).unwrap_err();
+        assert!(error.to_string().contains("queue_buffering_max_messages"));
     }
 
     #[test]

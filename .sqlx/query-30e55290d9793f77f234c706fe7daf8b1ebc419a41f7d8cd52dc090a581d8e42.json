@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            event_id,\n            chain_id::text AS \"chain_id!\",\n            event_kind,\n            block_hash,\n            block_height,\n            payload\n        FROM outbox_events\n        WHERE published_at IS NULL\n        ORDER BY event_id\n        LIMIT 1\n        FOR UPDATE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "chain_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "event_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "block_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "block_height",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "payload",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "30e55290d9793f77f234c706fe7daf8b1ebc419a41f7d8cd52dc090a581d8e42"
+}

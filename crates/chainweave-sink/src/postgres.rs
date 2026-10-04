@@ -693,6 +693,24 @@ impl PostgresChainWriter {
         header: BlockHeader,
         block: Option<&IndexedBlock>,
     ) -> Result<(), PostgresStateError> {
+        let logs = block.map(|value| {
+            value
+                .logs
+                .iter()
+                .map(|log| {
+                    json!({
+                        "transaction_index": log.transaction_index,
+                        "log_index": log.log_index,
+                        "tx_hash": hex_hash(&log.tx_hash),
+                        "address": hex_bytes(&log.address),
+                        "topics": log.topics.iter().map(hex_hash).collect::<Vec<_>>(),
+                        "data": hex_bytes(&log.data),
+                        "decoded_event": log.decoded_event,
+                        "decoder_version": log.decoder_version,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
         let payload = json!({
             "schema_version": 1,
             "transition": event_kind,
@@ -703,6 +721,7 @@ impl PostgresChainWriter {
             "status": block.map(|value| value.status.as_str()),
             "status_source": block.map(|value| value.status_source.as_str()),
             "log_count": block.map_or(0, |value| value.logs.len()),
+            "logs": logs.unwrap_or_default(),
         });
 
         sqlx::query!(
@@ -1432,9 +1451,13 @@ fn address_from_vec(value: Vec<u8>) -> Result<[u8; 20], PostgresStateError> {
 }
 
 fn hex_hash(hash: &BlockHash) -> String {
+    hex_bytes(hash)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(66);
     output.push_str("0x");
-    for byte in hash {
+    for byte in bytes {
         write!(&mut output, "{byte:02x}").expect("writing to string cannot fail");
     }
     output
