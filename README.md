@@ -106,7 +106,44 @@ canonical continuity: 50000 blocks from 11594001 through 11644000
 RPC budget used: 51001 requests / 55001 cost units (1020.02 calls per 1k blocks)
 ```
 
-This remains bounded historical backfill work only. Live streaming, websocket subscriptions, live wakeups, ABI decoding, and Kafka delivery are available in later milestone slices; production metrics are a later milestone.
+## Live Streaming & 24h Soak Verification
+
+Chainweave tracks the live tip using an Alloy WebSocket subscription for `newHeads` wakeups paired with ordered reconciliation from the durable Postgres checkpoint. To prevent memory runaway during bursts, the subscription feeds a capacity-1 coalescing wakeup channel; on wakeup, the sequential runner reads `latest` and reconciles missing heights sequentially with natural backpressure.
+
+Run live streaming from the durable checkpoint or explicit block height:
+
+```bash
+CHAINWEAVE_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+cargo run -p chainweave-cli -- \
+  --rpc-url wss://eth-sepolia.g.alchemy.com/v2/YOUR_KEY \
+  --expected-chain-id 11155111 \
+  --expected-genesis-hash 0x25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9 \
+  --server-listen-addr 127.0.0.1:9100 \
+  live \
+  --start-block 11839851
+```
+
+### Production 24-Hour Soak Acceptance
+
+Streaming stability and memory bounds were verified via an unattended 24-hour soak run (`scripts/soak.sh`) against Ethereum Sepolia on AWS EC2, followed by cryptographic parity validation against primary RPC (`scripts/check-canonical.sh`).
+
+Acceptance result from October 4–5, 2026:
+
+```text
+duration: 86400s (24h continuous)
+canonical continuity: 6599 blocks from 11839851 through 11846449
+missing heights: 0 (zero dropped blocks)
+checkpoint refs canonical: 1 (height 11846449, hash 0xc4884c51232fb3f00843574a40ed6666477c007fba063f5743bb006366f9d4e8)
+sampled RPC hash verification: 265 blocks checked against Sepolia RPC (step 25), 0 mismatches
+live lag blocks: 0
+live reconnect count: 0
+unreconciled gaps: 0
+wakeup channel depth: 0 (never exceeded capacity-1 coalescing limit)
+process panics: 0
+memory RSS: flat and stable after warm-up
+```
+
+Detailed operator log is archived in [`soak-24h-metrics.log`](soak-24h-metrics.log) and [`docs/m4-live-acceptance.md`](docs/m4-live-acceptance.md).
 
 ## Tests
 
