@@ -23,6 +23,7 @@ use rdkafka::{
     ClientConfig, Message,
     consumer::{CommitMode, Consumer, StreamConsumer},
 };
+use sqlx::postgres::PgPoolOptions;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -103,6 +104,8 @@ enum Command {
         #[arg(long)]
         max_messages: Option<usize>,
     },
+    /// Run migrations and serve health/readiness for the compose demo.
+    ComposeDemo,
 }
 
 #[tokio::main]
@@ -168,6 +171,7 @@ async fn main() -> Result<()> {
         Command::KafkaDemoConsumer { max_messages } => {
             run_kafka_demo_consumer(&config, max_messages).await
         }
+        Command::ComposeDemo => run_compose_demo(&config).await,
     }
 }
 
@@ -638,6 +642,52 @@ async fn run_kafka_demo_consumer(config: &AppConfig, max_messages: Option<usize>
         consumer
             .commit_message(&message, CommitMode::Sync)
             .context("failed to commit Kafka offset")?;
+    }
+}
+
+async fn run_compose_demo(config: &AppConfig) -> Result<()> {
+    config
+        .validate(ValidationProfile::Workers)
+        .context("configuration validation failed")?;
+    let database_url = config
+        .database_url
+        .as_deref()
+        .context("database_url is required before running the compose demo")?;
+
+    let health = HealthState::default();
+    let observability = ObservabilityServer::bind(config.server.listen_addr, health.clone())
+        .await
+        .context("failed to start observability server")?;
+    let observability_addr = observability
+        .local_addr()
+        .context("failed to read observability listener address")?;
+    let cancel = CancellationToken::new();
+    let shutdown = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %error, "failed to listen for ctrl-c");
+        }
+        shutdown.cancel();
+    });
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await
+        .context("failed to connect to Postgres")?;
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .context("failed to run Postgres migrations")?;
+    health.mark_ready(true).await;
+
+    info!(
+        observability_addr = %observability_addr,
+        "compose demo ready after applying migrations"
+    );
+    tokio::select! {
+        () = cancel.cancelled() => Ok(()),
+        result = observability.serve() => result.context("observability server failed"),
     }
 }
 
@@ -1228,6 +1278,12 @@ mod tests {
         assert_eq!(poll_interval_ms, 250);
         assert_eq!(budget_window_secs, 5);
         assert_eq!(budget_cost_units, 99);
+    }
+
+    #[test]
+    fn cli_parses_compose_demo_command() {
+        let cli = Cli::try_parse_from(["chainweave", "compose-demo"]).unwrap();
+        assert!(matches!(cli.command, Command::ComposeDemo));
     }
 
     #[tokio::test]

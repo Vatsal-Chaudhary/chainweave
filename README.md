@@ -2,7 +2,52 @@
 
 A reorg-safe EVM chain indexer in Rust. The project is being delivered incrementally from the [FDD](docs/reorg-safe-indexer-FDD-v2.md); the current baseline establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, observability primitives, transactional Postgres state for canonical blocks/logs/checkpoints/outbox rows, and at-least-once Kafka outbox delivery.
 
+## Correctness contract
+
+| Concern | Contract |
+|---|---|
+| Reorg handling | Detect parent mismatches, prove the common ancestor, roll back orphaned blocks descendant-first, then apply the replacement branch ancestor-first. |
+| Chain history | Never delete chain data during reorg handling; orphaned blocks are retained with `is_canonical = false`. |
+| Log identity | Raw logs are keyed by `(chain_id, block_hash, log_index)`, so replaying the same fork is idempotent. |
+| Postgres state | Canonical block state, raw logs, checkpoints, and outbox rows commit atomically in one transaction. |
+| Kafka delivery | Outbox delivery is at least once. Retries reuse stable `event_id` values so downstream consumers can deduplicate. |
+| Trust boundary | The indexer follows one configured primary RPC; it does not independently execute consensus or silently fail over to another fork choice. |
+
+## Reorg problem
+
+An EVM block at height N can later be orphaned and replaced by a different block at the same height. An indexer that treats block numbers as permanent facts will keep phantom logs, double-count replacement activity, or corrupt balances. `chainweave` anchors state to block hashes, keeps old fork data for auditability, and updates canonical state only through ordered, idempotent transitions.
+
 ## Quickstart
+
+Start the packaged Postgres-only demo:
+
+```bash
+docker compose up
+```
+
+The compose stack runs pinned Postgres plus a `chainweave` demo process that loads the secret-free sample configuration (`config/chainweave.compose.toml`), receives `CHAINWEAVE_DATABASE_URL` at runtime via `docker-compose.yml`, runs the checked-in migrations explicitly, and exposes:
+
+```text
+http://127.0.0.1:19100/health
+http://127.0.0.1:19100/ready
+http://127.0.0.1:19100/metrics
+```
+
+This demo does not ingest blocks by itself. It packages the durable Postgres path so the deterministic Anvil reorg scenario can run against the same database:
+
+```bash
+make test-minimal-packaging-demo
+```
+
+To run the scenario manually against an already running compose database:
+
+```bash
+M8_LITE_EXTERNAL_POSTGRES=true \
+M8_LITE_DATABASE_URL=postgresql://chainweave:chainweave@127.0.0.1:55440/chainweave \
+make test-single-anvil-reorg-scenario
+```
+
+## Local CLI
 
 Install the Rust toolchain, then run a local EVM node. Anvil is distributed with Foundry:
 
@@ -166,3 +211,9 @@ flowchart TD
     M -. durable sink .-> N[Postgres transaction<br/>blocks/logs/checkpoint]
     N -. outbox delivery .-> O[Kafka outbox dispatcher]
 ```
+
+## Scope and roadmap
+
+The packaged demo is intentionally Postgres-only: it validates configuration, applies migrations, exposes health/readiness/metrics, and supports the deterministic Anvil reorg scenario. Kafka remains available through the existing `kafka-dispatch` and demo-consumer commands, but it is not part of the default compose stack.
+
+Deferred work includes a Query API, dashboards, webhooks, operator runbooks, retention guidance, broader deployment hardening, multi-chain operation, and independent fork-choice or consensus verification.

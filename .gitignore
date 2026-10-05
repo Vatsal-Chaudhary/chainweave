@@ -1,5 +1,7 @@
 AGENTS.md
 docs/
+docs/reorg-safe-indexer-FDD.md
+docs/reorg-safe-indexer-FDD-v2.md
 /target/
 /target-*/
 *.local.toml

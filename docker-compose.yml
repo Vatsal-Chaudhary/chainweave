@@ -1,0 +1,45 @@
+name: chainweave-demo
+
+services:
+  postgres:
+    image: postgres:16.6-alpine3.20
+    environment:
+      POSTGRES_USER: chainweave
+      POSTGRES_PASSWORD: chainweave
+      POSTGRES_DB: chainweave
+    ports:
+      - "127.0.0.1:${CHAINWEAVE_DEMO_POSTGRES_PORT:-55440}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chainweave -d chainweave"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chainweave:0.1.0-compose-demo
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CHAINWEAVE_DATABASE_URL: postgresql://chainweave:chainweave@postgres:5432/chainweave
+    command: ["--config", "/etc/chainweave/chainweave.toml", "compose-demo"]
+    ports:
+      - "127.0.0.1:${CHAINWEAVE_DEMO_HTTP_PORT:-19100}:9100"
+    volumes:
+      - ./config/chainweave.compose.toml:/etc/chainweave/chainweave.toml:ro
+    init: true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9100/ready >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  postgres-data:

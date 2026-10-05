@@ -1,0 +1,22 @@
+[rpc]
+primary_url = "http://127.0.0.1:8545"
+
+[indexer]
+header_cache_size = 256
+max_reorg_depth = 2048
+
+[abi]
+enabled = false
+
+[kafka]
+brokers = []
+outbox_topic = "chainweave.outbox"
+consumer_group = "chainweave-demo-consumer"
+queue_buffering_max_messages = 10000
+delivery_timeout_ms = 30000
+dispatcher_poll_ms = 1000
+
+[server]
+listen_addr = "0.0.0.0:9100"
+
+# Set database secrets through CHAINWEAVE_DATABASE_URL in docker-compose.yml.

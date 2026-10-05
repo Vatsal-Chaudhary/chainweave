@@ -16,6 +16,10 @@ M8_LITE_POSTGRES_DATA_DIR ?= target/m8-lite-postgres-data
 M8_LITE_POSTGRES_SOCKET_DIR ?= target/m8-lite-postgres-socket
 M8_LITE_POSTGRES_LOG ?= target/m8-lite-postgres.log
 M8_LITE_DATABASE_URL ?= postgresql://postgres:postgres@127.0.0.1:$(M8_LITE_POSTGRES_PORT)/postgres
+M8_LITE_EXTERNAL_POSTGRES ?= false
+M10_LITE_POSTGRES_PORT ?= 55440
+M10_LITE_HTTP_PORT ?= 19100
+M10_LITE_DATABASE_URL ?= postgresql://chainweave:chainweave@127.0.0.1:$(M10_LITE_POSTGRES_PORT)/chainweave
 
 BACKFILL_ACCEPTANCE_RPC_URL ?= https://rpc.sepolia.ethpandaops.io
 BACKFILL_ACCEPTANCE_REFERENCE_RPC_URL ?= https://sepolia.gateway.tenderly.co
@@ -237,7 +241,9 @@ test-single-anvil-reorg-scenario:
 		exit 127
 	fi
 	backend=
-	if [[ '$(POSTGRES_STATE_PROVIDER)' != 'local' ]] && docker ps >/dev/null 2>&1; then
+	if [[ '$(M8_LITE_EXTERNAL_POSTGRES)' == 'true' ]]; then
+		backend=external
+	elif [[ '$(POSTGRES_STATE_PROVIDER)' != 'local' ]] && docker ps >/dev/null 2>&1; then
 		backend=docker
 		if docker ps -a --format '{{.Names}}' | grep -qx '$(M8_LITE_POSTGRES_CONTAINER)'; then
 			docker rm -f '$(M8_LITE_POSTGRES_CONTAINER)' >/dev/null
@@ -273,25 +279,61 @@ test-single-anvil-reorg-scenario:
 		fi
 	}
 	trap cleanup EXIT
-	for attempt in $$(seq 1 60); do
-		if [[ "$$backend" == 'docker' ]]; then
-			if docker exec '$(M8_LITE_POSTGRES_CONTAINER)' pg_isready -U postgres >/dev/null 2>&1; then
-				break
+	if [[ "$$backend" != 'external' ]]; then
+		for attempt in $$(seq 1 60); do
+			if [[ "$$backend" == 'docker' ]]; then
+				if docker exec '$(M8_LITE_POSTGRES_CONTAINER)' pg_isready -U postgres >/dev/null 2>&1; then
+					break
+				fi
+			else
+				if pg_isready -h 127.0.0.1 -p '$(M8_LITE_POSTGRES_PORT)' -U postgres >/dev/null 2>&1; then
+					break
+				fi
 			fi
-		else
-			if pg_isready -h 127.0.0.1 -p '$(M8_LITE_POSTGRES_PORT)' -U postgres >/dev/null 2>&1; then
-				break
+			if [[ "$$attempt" == 60 ]]; then
+				printf 'Postgres did not become ready in time\n'
+				exit 1
 			fi
-		fi
-		if [[ "$$attempt" == 60 ]]; then
-			printf 'Postgres did not become ready in time\n'
-			exit 1
-		fi
-		sleep 1
-	done
+			sleep 1
+		done
+	fi
 	CHAINWEAVE_TEST_DATABASE_URL='$(M8_LITE_DATABASE_URL)' \
 	SQLX_OFFLINE=true \
 	cargo test -p chainweave-cli --test single_anvil_reorg_scenario -- --ignored --nocapture
+
+.PHONY: test-minimal-packaging-demo
+test-minimal-packaging-demo:
+	if ! command -v anvil >/dev/null 2>&1; then
+		printf 'anvil is required for the minimal packaging demo check\n'
+		exit 127
+	fi
+	if ! command -v curl >/dev/null 2>&1; then
+		printf 'curl is required for the minimal packaging demo readiness check\n'
+		exit 127
+	fi
+	docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+	cleanup() {
+		docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+	}
+	trap cleanup EXIT
+	CHAINWEAVE_DEMO_POSTGRES_PORT='$(M10_LITE_POSTGRES_PORT)' \
+	CHAINWEAVE_DEMO_HTTP_PORT='$(M10_LITE_HTTP_PORT)' \
+	docker compose up -d --build
+	for attempt in $$(seq 1 120); do
+		if curl -fsS 'http://127.0.0.1:$(M10_LITE_HTTP_PORT)/ready' >/dev/null 2>&1; then
+			break
+		fi
+		if [[ "$$attempt" == 120 ]]; then
+			docker compose ps
+			docker compose logs --no-color postgres indexer
+			printf 'compose demo did not become ready in time\n'
+			exit 1
+		fi
+		sleep 2
+	done
+	M8_LITE_EXTERNAL_POSTGRES=true \
+	M8_LITE_DATABASE_URL='$(M10_LITE_DATABASE_URL)' \
+	$(MAKE) test-single-anvil-reorg-scenario
 
 .PHONY: test-live-acceptance
 test-live-acceptance:
