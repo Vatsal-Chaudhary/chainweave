@@ -1,5 +1,6 @@
 AGENTS.md
 docs/
 /target/
+/target-*/
 *.local.toml
 .env
