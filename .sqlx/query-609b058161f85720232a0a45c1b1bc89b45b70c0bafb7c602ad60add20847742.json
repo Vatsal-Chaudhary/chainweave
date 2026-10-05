@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*)::BIGINT AS \"unpublished_count!\",\n            COALESCE(\n                EXTRACT(EPOCH FROM (now() - MIN(created_at))),\n                0\n            )::DOUBLE PRECISION AS \"oldest_age_seconds!\"\n        FROM outbox_events\n        WHERE published_at IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "unpublished_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "oldest_age_seconds!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "609b058161f85720232a0a45c1b1bc89b45b70c0bafb7c602ad60add20847742"
+}

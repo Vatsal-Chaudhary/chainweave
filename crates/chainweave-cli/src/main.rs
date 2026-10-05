@@ -14,8 +14,9 @@ use chainweave_rpc::{
     classify_rpc_error, fetch_header_by_number_with_retry,
 };
 use chainweave_sink::{
-    AbiRegistry, IndexedBlock, KafkaDispatcherConfig, KafkaOutboxDispatcher,
-    PostgresBackfillCommitter, PostgresChainWriter, render_demo_consumer_event,
+    AbiRegistry, HealthState, IndexedBlock, KafkaDispatcherConfig, KafkaOutboxDispatcher,
+    ObservabilityServer, PostgresBackfillCommitter, PostgresChainWriter,
+    render_demo_consumer_event,
 };
 use clap::{Parser, Subcommand};
 use rdkafka::{
@@ -546,9 +547,13 @@ async fn run_kafka_dispatcher(config: &AppConfig) -> Result<()> {
         .as_deref()
         .context("database_url is required before running the Kafka dispatcher")?;
     let dispatcher_config = kafka_dispatcher_config(config)?;
-    let dispatcher = KafkaOutboxDispatcher::connect_database(database_url, dispatcher_config)
+    let health = HealthState::default();
+    let observability = ObservabilityServer::bind(config.server.listen_addr, health.clone())
         .await
-        .context("failed to start Kafka outbox dispatcher")?;
+        .context("failed to start observability server")?;
+    let observability_addr = observability
+        .local_addr()
+        .context("failed to read observability listener address")?;
     let cancel = CancellationToken::new();
     let shutdown = cancel.clone();
     tokio::spawn(async move {
@@ -557,7 +562,33 @@ async fn run_kafka_dispatcher(config: &AppConfig) -> Result<()> {
         }
         shutdown.cancel();
     });
-    dispatcher.run_until_cancelled(cancel).await?;
+    let health_cancel = cancel.clone();
+    let health_task = tokio::spawn(async move {
+        tokio::select! {
+            () = health_cancel.cancelled() => Ok(()),
+            result = observability.serve() => result,
+        }
+    });
+    info!(
+        observability_addr = %observability_addr,
+        "starting Kafka outbox dispatcher"
+    );
+
+    let dispatcher =
+        match KafkaOutboxDispatcher::connect_database(database_url, dispatcher_config).await {
+            Ok(dispatcher) => dispatcher.with_health(health.clone()),
+            Err(error) => {
+                health.mark_degraded("kafka").await;
+                cancel.cancel();
+                let _ = health_task.await;
+                return Err(error).context("failed to start Kafka outbox dispatcher");
+            }
+        };
+    health.mark_ready(true).await;
+    let result = dispatcher.run_until_cancelled(cancel.clone()).await;
+    cancel.cancel();
+    let _ = health_task.await;
+    result.context("Kafka outbox dispatcher failed")?;
     Ok(())
 }
 

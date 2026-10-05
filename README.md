@@ -1,6 +1,6 @@
 # chainweave
 
-A reorg-safe EVM chain indexer in Rust. The project is being delivered incrementally from the [FDD](docs/reorg-safe-indexer-FDD.md); the current baseline establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, observability primitives, transactional Postgres state for canonical blocks/logs/checkpoints/outbox rows, and at-least-once Kafka outbox delivery.
+A reorg-safe EVM chain indexer in Rust. The project is being delivered incrementally from the [FDD](docs/reorg-safe-indexer-FDD-v2.md); the current baseline establishes validated configuration, Alloy HTTP/WS connectivity, chain identity checks, observability primitives, transactional Postgres state for canonical blocks/logs/checkpoints/outbox rows, and at-least-once Kafka outbox delivery.
 
 ## Quickstart
 

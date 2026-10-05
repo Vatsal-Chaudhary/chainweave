@@ -561,24 +561,64 @@ pub async fn run_live(
         "starting live runner"
     );
 
-    let primary_client = connect_rpc(&config.rpc.primary_url).await?;
+    let primary_client = match connect_rpc(&config.rpc.primary_url).await {
+        Ok(client) => client,
+        Err(error) => {
+            health.mark_degraded("rpc").await;
+            return Err(error);
+        }
+    };
     let primary_head =
-        capture_target_head_with_retry(&primary_client, retry_policy, options.rpc_timeout).await?;
+        match capture_target_head_with_retry(&primary_client, retry_policy, options.rpc_timeout)
+            .await
+        {
+            Ok(head) => head,
+            Err(error) => {
+                health.mark_degraded("rpc").await;
+                return Err(error.into());
+            }
+        };
     if let Some(expected) = &config.expected_chain {
-        RpcClient::verify_identity(&primary_head, expected)?;
+        if let Err(error) = RpcClient::verify_identity(&primary_head, expected) {
+            health
+                .mark_correctness_stop("chain_identity_mismatch")
+                .await;
+            return Err(error.into());
+        }
     }
 
     let verifier_client = if let Some(url) = &config.rpc.verifier_url {
-        let verifier_client = connect_rpc(url).await?;
-        let verifier_head =
-            capture_target_head_with_retry(&verifier_client, retry_policy, options.rpc_timeout)
-                .await?;
-        verify_verifier_chain_identity(
+        let verifier_client = match connect_rpc(url).await {
+            Ok(client) => client,
+            Err(error) => {
+                health.mark_degraded("rpc").await;
+                return Err(error);
+            }
+        };
+        let verifier_head = match capture_target_head_with_retry(
+            &verifier_client,
+            retry_policy,
+            options.rpc_timeout,
+        )
+        .await
+        {
+            Ok(head) => head,
+            Err(error) => {
+                health.mark_degraded("rpc").await;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = verify_verifier_chain_identity(
             primary_head.chain_id,
             primary_head.genesis_hash.to_string(),
             verifier_head.chain_id,
             verifier_head.genesis_hash.to_string(),
-        )?;
+        ) {
+            health
+                .mark_correctness_stop("chain_identity_mismatch")
+                .await;
+            return Err(error.into());
+        }
         Some(verifier_client)
     } else {
         None
@@ -592,9 +632,17 @@ pub async fn run_live(
         .run_migrations()
         .await
         .map_err(|error| LiveRuntimeError::Migration(error.to_string()))?;
-    writer
+    if let Err(error) = writer
         .ensure_chain_identity(primary_head.genesis_block_hash())
-        .await?;
+        .await
+    {
+        if matches!(error, PostgresStateError::ChainIdentityMismatch { .. }) {
+            health
+                .mark_correctness_stop("chain_identity_mismatch")
+                .await;
+        }
+        return Err(error.into());
+    }
     let checkpoint = writer.checkpoint().await?;
     let start_point = checkpoint
         .as_ref()
@@ -616,6 +664,7 @@ pub async fn run_live(
             websocket_wakeup_task(
                 config.rpc.primary_url.clone(),
                 wakeups.clone(),
+                health.clone(),
                 shutdown.clone(),
             ),
         );
@@ -686,6 +735,7 @@ async fn health_server_task(
 async fn websocket_wakeup_task(
     ws_url: Url,
     wakeups: NewHeadWakeupSender,
+    health: HealthState,
     shutdown: CancellationToken,
 ) -> Result<(), LiveTaskError> {
     loop {
@@ -700,6 +750,7 @@ async fn websocket_wakeup_task(
                 match joined {
                     Ok(Ok(())) => return Ok(()),
                     Ok(Err(error)) => {
+                        health.mark_degraded("rpc").await;
                         warn!(error = %error, "newHeads subscription ended; reconnecting");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
@@ -850,7 +901,25 @@ async fn reconcile_and_publish(
     unreconciled_gap_count: Option<u64>,
 ) -> Result<(), LiveRuntimeError> {
     reconnect.record_subscribed_for_wakeups();
-    let report = reconcile_once(writer, source, options, max_reorg_depth, shutdown).await?;
+    let report = match reconcile_once(writer, source, options, max_reorg_depth, shutdown).await {
+        Ok(report) => report,
+        Err(error) => {
+            if live_runtime_error_is_rpc_degradation(&error) {
+                let _ = reconnect.record_availability_failure();
+                health.mark_degraded("rpc").await;
+            }
+            return Err(error);
+        }
+    };
+    if let Some(reason) = report.halted {
+        let reason = correctness_stop_reason(reason);
+        let _ = reconnect.record_correctness_error();
+        health.mark_correctness_stop(reason).await;
+        return Err(LiveRuntimeError::Task(LiveTaskError::TaskFailed(
+            LiveTask::Tracker,
+            format!("correctness-stop: {reason}"),
+        )));
+    }
     reconnect.record_reconciled_to_head()?;
     reconnect.record_ready_after_reconnect_at(Instant::now())?;
     let gap_count = unreconciled_gap_count.unwrap_or_else(|| {
@@ -867,6 +936,25 @@ async fn reconcile_and_publish(
         writer, source, reconnect, health, context, wakeup_rx, gap_count,
     )
     .await
+}
+
+fn correctness_stop_reason(reason: chainweave_core::LiveHaltReason) -> &'static str {
+    match reason {
+        chainweave_core::LiveHaltReason::MaxReorgDepth => "unresolved_ancestry",
+        chainweave_core::LiveHaltReason::FinalizedBoundary => "finalized_boundary_violation",
+        chainweave_core::LiveHaltReason::MissingExplicitStart
+        | chainweave_core::LiveHaltReason::Correctness => "correctness_stop",
+    }
+}
+
+fn live_runtime_error_is_rpc_degradation(error: &LiveRuntimeError) -> bool {
+    matches!(
+        error,
+        LiveRuntimeError::RpcEndpoint { .. }
+            | LiveRuntimeError::Rpc(_)
+            | LiveRuntimeError::Task(LiveTaskError::RpcTransient(_))
+            | LiveRuntimeError::Task(LiveTaskError::WebSocketTransient(_))
+    )
 }
 
 async fn reconcile_once(
@@ -1789,6 +1877,18 @@ mod tests {
         assert_eq!(
             readiness_from_reconnect(&reconnect, 1, 0),
             (false, "degraded")
+        );
+    }
+
+    #[test]
+    fn correctness_stop_reasons_cover_required_health_cases() {
+        assert_eq!(
+            correctness_stop_reason(chainweave_core::LiveHaltReason::MaxReorgDepth),
+            "unresolved_ancestry"
+        );
+        assert_eq!(
+            correctness_stop_reason(chainweave_core::LiveHaltReason::FinalizedBoundary),
+            "finalized_boundary_violation"
         );
     }
 

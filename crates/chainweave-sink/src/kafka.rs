@@ -1,5 +1,6 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
+use metrics::{counter, gauge};
 use rdkafka::{
     ClientConfig,
     error::KafkaError,
@@ -13,6 +14,8 @@ use thiserror::Error;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+use crate::HealthState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KafkaDispatcherConfig {
@@ -59,6 +62,7 @@ pub struct KafkaOutboxDispatcher<P = RdkafkaOutboxProducer> {
     topic: String,
     producer: P,
     poll_interval: Duration,
+    health: Option<HealthState>,
 }
 
 #[derive(Clone)]
@@ -186,7 +190,14 @@ where
             topic,
             producer,
             poll_interval,
+            health: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_health(mut self, health: HealthState) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// Dispatches unpublished rows until cancellation or a publish error.
@@ -247,6 +258,7 @@ where
         let mut tx = self.pool.begin().await?;
         let Some(row) = next_unpublished_row(&mut tx).await? else {
             tx.commit().await?;
+            self.refresh_outbox_metrics_best_effort().await;
             return Ok(KafkaDispatchOutcome::Idle);
         };
         let message = row_to_message(row)?;
@@ -257,13 +269,16 @@ where
             });
         }
 
-        self.producer
-            .publish(&self.topic, &message)
-            .await
-            .map_err(|error_message| KafkaDispatchError::Publish {
+        if let Err(error_message) = self.producer.publish(&self.topic, &message).await {
+            counter!("chainweave_kafka_delivery_failures_total").increment(1);
+            if let Some(health) = &self.health {
+                health.mark_degraded("kafka").await;
+            }
+            return Err(KafkaDispatchError::Publish {
                 event_id: message.event_id,
                 message: error_message,
-            })?;
+            });
+        }
 
         if failure == Some(KafkaDispatchFailurePoint::AfterBrokerAckBeforeMark) {
             return Err(KafkaDispatchError::InjectedAfterAck {
@@ -288,7 +303,22 @@ where
             );
         }
         tx.commit().await?;
+        info!(
+            chain_id = %message.chain_id,
+            block_hash = %message.block_hash,
+            block_height = message.block_height,
+            event_id = message.event_id,
+            transition_kind = %message.transition_kind,
+            "marked outbox event delivered"
+        );
+        self.refresh_outbox_metrics_best_effort().await;
         Ok(KafkaDispatchOutcome::Delivered(message))
+    }
+
+    async fn refresh_outbox_metrics_best_effort(&self) {
+        if let Err(error) = refresh_outbox_metrics(&self.pool).await {
+            warn!(error = %error, "failed to refresh Kafka outbox metrics");
+        }
     }
 }
 
@@ -420,6 +450,26 @@ async fn next_unpublished_row(
     )
     .fetch_optional(tx.as_mut())
     .await
+}
+
+async fn refresh_outbox_metrics(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*)::BIGINT AS "unpublished_count!",
+            COALESCE(
+                EXTRACT(EPOCH FROM (now() - MIN(created_at))),
+                0
+            )::DOUBLE PRECISION AS "oldest_age_seconds!"
+        FROM outbox_events
+        WHERE published_at IS NULL
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    gauge!("chainweave_outbox_unpublished_count").set(row.unpublished_count as f64);
+    gauge!("chainweave_outbox_unpublished_oldest_age_seconds").set(row.oldest_age_seconds);
+    Ok(())
 }
 
 fn row_to_message(row: OutboxRow) -> Result<KafkaOutboxMessage, KafkaDispatchError> {

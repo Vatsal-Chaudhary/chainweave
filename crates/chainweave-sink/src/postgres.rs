@@ -9,6 +9,7 @@ use chainweave_core::{
     AsyncRangeCommitSink, BlockHash, BlockHeader, ChainBatch, ChainEvent, ChainTransition,
     FetchedRange,
 };
+use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -16,7 +17,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{AbiRegistry, DecodeReport};
 
@@ -432,8 +433,17 @@ impl PostgresChainWriter {
             match event {
                 DurableChainEvent::Rollback(header) => {
                     if self.rollback_block(&mut tx, *header).await? {
-                        self.append_outbox(&mut tx, "rollback", *header, None)
+                        let event_id = self
+                            .append_outbox(&mut tx, "rollback", *header, None)
                             .await?;
+                        info!(
+                            chain_id = %self.chain_id,
+                            block_hash = %hex_hash(&header.hash),
+                            block_height = header.height,
+                            event_id,
+                            transition_kind = "rollback",
+                            "appended outbox transition"
+                        );
                         report.rolled_back_blocks += 1;
                         report.appended_outbox_events += 1;
                     }
@@ -444,8 +454,17 @@ impl PostgresChainWriter {
                     let log_count = self.upsert_logs(&mut tx, block).await?;
                     report.upserted_logs += log_count;
                     if changed {
-                        self.append_outbox(&mut tx, "apply", block.header, Some(block))
+                        let event_id = self
+                            .append_outbox(&mut tx, "apply", block.header, Some(block))
                             .await?;
+                        info!(
+                            chain_id = %self.chain_id,
+                            block_hash = %hex_hash(&block.header.hash),
+                            block_height = block.header.height,
+                            event_id,
+                            transition_kind = "apply",
+                            "appended outbox transition"
+                        );
                         report.applied_blocks += 1;
                         report.appended_outbox_events += 1;
                     }
@@ -470,6 +489,24 @@ impl PostgresChainWriter {
         if crash_point == Some(CrashPoint::AfterCommit) {
             pending_crash().await;
         }
+
+        if let Some(target) = checkpoint_target {
+            gauge!("chainweave_checkpoint_height").set(target.height as f64);
+            info!(
+                chain_id = %self.chain_id,
+                block_hash = %hex_hash(&target.hash),
+                block_height = target.height,
+                "advanced durable checkpoint"
+            );
+        }
+        if batch.transition == ChainTransition::Reorg
+            && (report.rolled_back_blocks > 0 || report.applied_blocks > 0)
+        {
+            let depth = report.rolled_back_blocks.max(report.applied_blocks);
+            counter!("chainweave_reorg_total").increment(1);
+            gauge!("chainweave_reorg_depth_blocks").set(depth as f64);
+        }
+        self.refresh_observability_metrics_best_effort().await;
 
         Ok(report)
     }
@@ -692,7 +729,7 @@ impl PostgresChainWriter {
         event_kind: &str,
         header: BlockHeader,
         block: Option<&IndexedBlock>,
-    ) -> Result<(), PostgresStateError> {
+    ) -> Result<i64, PostgresStateError> {
         let logs = block.map(|value| {
             value
                 .logs
@@ -724,12 +761,13 @@ impl PostgresChainWriter {
             "logs": logs.unwrap_or_default(),
         });
 
-        sqlx::query!(
+        let event_id = sqlx::query_scalar!(
             r"
             INSERT INTO outbox_events (
                 chain_id, event_kind, block_hash, block_height, payload
             )
             VALUES (($1::text)::numeric, $2, $3, $4, $5)
+            RETURNING event_id
             ",
             &self.chain_id,
             event_kind,
@@ -737,8 +775,51 @@ impl PostgresChainWriter {
             pg_height(header.height)?,
             payload,
         )
-        .execute(tx.as_mut())
+        .fetch_one(tx.as_mut())
         .await?;
+        Ok(event_id)
+    }
+
+    async fn refresh_observability_metrics_best_effort(&self) {
+        if let Err(error) = self.refresh_observability_metrics().await {
+            warn!(
+                chain_id = %self.chain_id,
+                error = %error,
+                "failed to refresh observability metrics"
+            );
+        }
+    }
+
+    /// Publishes database-derived observability gauges for the configured chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or conversion error when the checkpoint or outbox cannot be read.
+    pub async fn refresh_observability_metrics(&self) -> Result<(), PostgresStateError> {
+        if let Some(checkpoint) = self.checkpoint().await? {
+            gauge!("chainweave_checkpoint_height").set(checkpoint.last_height as f64);
+        } else {
+            gauge!("chainweave_checkpoint_height").set(0.0);
+        }
+
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS "unpublished_count!",
+                COALESCE(
+                    EXTRACT(EPOCH FROM (now() - MIN(created_at))),
+                    0
+                )::DOUBLE PRECISION AS "oldest_age_seconds!"
+            FROM outbox_events
+            WHERE chain_id = ($1::text)::numeric
+              AND published_at IS NULL
+            "#,
+            &self.chain_id,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        gauge!("chainweave_outbox_unpublished_count").set(row.unpublished_count as f64);
+        gauge!("chainweave_outbox_unpublished_oldest_age_seconds").set(row.oldest_age_seconds);
         Ok(())
     }
 
@@ -1923,6 +2004,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reorg_transaction_kill_restart_matches_clean_run() {
+        let Some(clean_db) = TestDb::create().await else {
+            return;
+        };
+        clean_db
+            .writer
+            .ensure_chain_identity(hash(90))
+            .await
+            .unwrap();
+        seed_reorg_base(&clean_db.writer).await;
+        clean_db.writer.apply_batch(&reorg_batch()).await.unwrap();
+        let clean_state = durable_state_snapshot(&clean_db.writer).await;
+
+        let Some(db) = TestDb::create().await else {
+            clean_db.cleanup().await;
+            return;
+        };
+        db.writer.ensure_chain_identity(hash(90)).await.unwrap();
+        seed_reorg_base(&db.writer).await;
+        let seed_state = durable_state_snapshot(&db.writer).await;
+
+        run_crash_child(&db, "reorg_step:4").await;
+        assert_eq!(durable_state_snapshot(&db.writer).await, seed_state);
+
+        db.writer.apply_batch(&reorg_batch()).await.unwrap();
+
+        assert_eq!(durable_state_snapshot(&db.writer).await, clean_state);
+        assert_checkpoint_references_canonical_block(&db.writer).await;
+        clean_db.cleanup().await;
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_drains_queued_batches() {
         let Some(db) = TestDb::create().await else {
             return;
@@ -2015,6 +2129,18 @@ mod tests {
                     .parse()
                     .expect("crash step must be an unsigned integer");
                 CrashPoint::TransactionStep(step)
+            }
+            step if step.starts_with("reorg_step:") => {
+                let step = step
+                    .strip_prefix("reorg_step:")
+                    .unwrap()
+                    .parse()
+                    .expect("crash step must be an unsigned integer");
+                writer
+                    .apply_batch_with_crash_point(&reorg_batch(), CrashPoint::TransactionStep(step))
+                    .await
+                    .unwrap();
+                return;
             }
             other => panic!("unknown crash helper mode {other}"),
         };
@@ -2327,6 +2453,21 @@ mod tests {
             .unwrap();
     }
 
+    async fn seed_reorg_base(writer: &PostgresChainWriter) {
+        writer
+            .apply_batch(&batch(
+                None,
+                [
+                    apply_block(0, 0),
+                    apply_block(1, 0),
+                    apply_block(2, 1),
+                    apply_block(3, 2),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
+
     async fn run_live_tracker_to_height(
         writer: &PostgresChainWriter,
         height: u64,
@@ -2551,6 +2692,19 @@ mod tests {
             None,
             [apply_block(0, 0), apply_block(1, 0), apply_block(2, 1)],
         )
+    }
+
+    fn reorg_batch() -> DurableChainBatch {
+        DurableChainBatch {
+            transition: ChainTransition::Reorg,
+            common_ancestor: Some(header(1, 0)),
+            events: vec![
+                DurableChainEvent::Rollback(header(3, 2)),
+                DurableChainEvent::Rollback(header(2, 1)),
+                DurableChainEvent::Apply(block(12, 1)),
+                DurableChainEvent::Apply(block(13, 12)),
+            ],
+        }
     }
 
     fn batch<const N: usize>(

@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use metrics::gauge;
+use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Serialize;
 use thiserror::Error;
@@ -23,6 +23,9 @@ struct StatusSnapshot {
     healthy: bool,
     ready: bool,
     readiness: String,
+    health_state: String,
+    degraded_components: Vec<String>,
+    correctness_stop_reason: Option<String>,
     primary_rpc_url: Option<String>,
     verifier_rpc_url: Option<String>,
     current_lag_blocks: u64,
@@ -56,6 +59,9 @@ struct StatusBody {
     status: &'static str,
     ready: bool,
     readiness: String,
+    health_state: String,
+    degraded_components: Vec<String>,
+    correctness_stop_reason: Option<String>,
     primary_rpc_url: Option<String>,
     verifier_rpc_url: Option<String>,
     current_lag_blocks: u64,
@@ -85,6 +91,9 @@ impl Default for StatusSnapshot {
             healthy: false,
             ready: false,
             readiness: "unavailable".to_owned(),
+            health_state: "unavailable".to_owned(),
+            degraded_components: Vec::new(),
+            correctness_stop_reason: None,
             primary_rpc_url: None,
             verifier_rpc_url: None,
             current_lag_blocks: 0,
@@ -98,10 +107,14 @@ impl Default for StatusSnapshot {
 
 impl From<LiveStatusSnapshot> for StatusSnapshot {
     fn from(snapshot: LiveStatusSnapshot) -> Self {
+        let health_state = live_health_state(snapshot.healthy, snapshot.ready, &snapshot.readiness);
         Self {
             healthy: snapshot.healthy,
             ready: snapshot.ready,
             readiness: snapshot.readiness,
+            health_state,
+            degraded_components: Vec::new(),
+            correctness_stop_reason: None,
             primary_rpc_url: snapshot.primary_rpc_url,
             verifier_rpc_url: snapshot.verifier_rpc_url,
             current_lag_blocks: snapshot.current_lag_blocks,
@@ -124,6 +137,9 @@ impl From<StatusSnapshot> for StatusBody {
             status,
             ready: snapshot.ready,
             readiness: snapshot.readiness,
+            health_state: snapshot.health_state,
+            degraded_components: snapshot.degraded_components,
+            correctness_stop_reason: snapshot.correctness_stop_reason,
             primary_rpc_url: snapshot.primary_rpc_url,
             verifier_rpc_url: snapshot.verifier_rpc_url,
             current_lag_blocks: snapshot.current_lag_blocks,
@@ -139,6 +155,16 @@ impl HealthState {
     pub async fn mark_healthy(&self, healthy: bool) {
         let mut snapshot = self.inner.write().await;
         snapshot.healthy = healthy;
+        if healthy {
+            snapshot.health_state = if snapshot.ready {
+                "ready".to_owned()
+            } else {
+                "unavailable".to_owned()
+            };
+            snapshot.correctness_stop_reason = None;
+        } else {
+            snapshot.health_state = "unavailable".to_owned();
+        }
         publish_metrics(&snapshot);
     }
 
@@ -146,6 +172,40 @@ impl HealthState {
         let mut snapshot = self.inner.write().await;
         snapshot.ready = ready;
         snapshot.readiness = if ready { "ready" } else { "unavailable" }.to_owned();
+        snapshot.health_state = snapshot.readiness.clone();
+        if ready {
+            snapshot.healthy = true;
+            snapshot.degraded_components.clear();
+            snapshot.correctness_stop_reason = None;
+        }
+        publish_metrics(&snapshot);
+    }
+
+    pub async fn mark_degraded(&self, component: &str) {
+        let mut snapshot = self.inner.write().await;
+        snapshot.healthy = true;
+        snapshot.ready = false;
+        snapshot.readiness = "degraded".to_owned();
+        snapshot.health_state = "degraded".to_owned();
+        snapshot.correctness_stop_reason = None;
+        if !snapshot
+            .degraded_components
+            .iter()
+            .any(|known| known == component)
+        {
+            snapshot.degraded_components.push(component.to_owned());
+        }
+        publish_metrics(&snapshot);
+    }
+
+    pub async fn mark_correctness_stop(&self, reason: &str) {
+        let mut snapshot = self.inner.write().await;
+        snapshot.healthy = false;
+        snapshot.ready = false;
+        snapshot.readiness = "correctness-stop".to_owned();
+        snapshot.health_state = "correctness-stop".to_owned();
+        snapshot.degraded_components.clear();
+        snapshot.correctness_stop_reason = Some(reason.to_owned());
         publish_metrics(&snapshot);
     }
 
@@ -170,6 +230,7 @@ impl ObservabilityServer {
         let metrics = PrometheusBuilder::new()
             .install_recorder()
             .map_err(|error| ObservabilityError::Metrics(error.to_string()))?;
+        publish_required_metric_defaults();
         let router = router(health, metrics);
         let listener = TcpListener::bind(address)
             .await
@@ -191,6 +252,7 @@ impl ObservabilityServer {
     ) -> Result<Self, ObservabilityError> {
         let recorder = PrometheusBuilder::new().build_recorder();
         let metrics = recorder.handle();
+        publish_required_metric_defaults();
         let router = router(health, metrics);
         let listener = TcpListener::bind(address)
             .await
@@ -246,8 +308,32 @@ fn status_response(ok: bool, snapshot: StatusSnapshot) -> Response {
     (code, Json(StatusBody::from(snapshot))).into_response()
 }
 
+fn live_health_state(healthy: bool, ready: bool, readiness: &str) -> String {
+    if !healthy {
+        "unavailable".to_owned()
+    } else if ready {
+        "ready".to_owned()
+    } else if readiness == "degraded" {
+        "degraded".to_owned()
+    } else {
+        "unavailable".to_owned()
+    }
+}
+
+fn publish_required_metric_defaults() {
+    gauge!("chainweave_current_lag_blocks").set(0.0);
+    gauge!("chainweave_checkpoint_height").set(0.0);
+    counter!("chainweave_reorg_total").increment(0);
+    gauge!("chainweave_reorg_depth_blocks").set(0.0);
+    gauge!("chainweave_outbox_unpublished_oldest_age_seconds").set(0.0);
+    gauge!("chainweave_outbox_unpublished_count").set(0.0);
+    counter!("chainweave_kafka_delivery_failures_total").increment(0);
+    counter!("chainweave_decode_failures_total").increment(0);
+}
+
 fn publish_metrics(snapshot: &StatusSnapshot) {
     gauge!("chainweave_live_ready").set(if snapshot.ready { 1.0 } else { 0.0 });
+    gauge!("chainweave_current_lag_blocks").set(snapshot.current_lag_blocks as f64);
     gauge!("chainweave_live_lag_blocks").set(snapshot.current_lag_blocks as f64);
     gauge!("chainweave_live_reconnect_count").set(snapshot.reconnect_count as f64);
     gauge!("chainweave_live_unreconciled_gap_count").set(snapshot.unreconciled_gap_count as f64);
@@ -317,5 +403,64 @@ mod tests {
         assert_eq!(snapshot.reconnect_count, 2);
         assert_eq!(snapshot.wakeup_depth, 1);
         assert_eq!(snapshot.verifier_disagreement_count, 7);
+    }
+
+    #[tokio::test]
+    async fn health_distinguishes_degraded_from_correctness_stop() {
+        let state = HealthState::default();
+
+        state.mark_degraded("rpc").await;
+        let degraded = health_endpoint(State(state.clone())).await;
+        assert_eq!(degraded.status(), StatusCode::OK);
+        let snapshot = state.inner.read().await.clone();
+        assert_eq!(snapshot.health_state, "degraded");
+        assert_eq!(snapshot.degraded_components, vec!["rpc"]);
+        assert_eq!(snapshot.correctness_stop_reason, None);
+
+        state.mark_correctness_stop("unresolved_ancestry").await;
+        let stopped = health_endpoint(State(state.clone())).await;
+        assert_eq!(stopped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let snapshot = state.inner.read().await.clone();
+        assert_eq!(snapshot.health_state, "correctness-stop");
+        assert_eq!(
+            snapshot.correctness_stop_reason.as_deref(),
+            Some("unresolved_ancestry")
+        );
+        assert!(snapshot.degraded_components.is_empty());
+    }
+
+    #[test]
+    fn prometheus_render_exposes_core_observability_series() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            publish_required_metric_defaults();
+            publish_metrics(&StatusSnapshot::from(LiveStatusSnapshot {
+                healthy: true,
+                ready: true,
+                readiness: "ready".to_owned(),
+                primary_rpc_url: None,
+                verifier_rpc_url: None,
+                current_lag_blocks: 5,
+                reconnect_count: 0,
+                wakeup_depth: 0,
+                unreconciled_gap_count: 0,
+                verifier_disagreement_count: 0,
+            }));
+        });
+        let metrics = handle.render();
+
+        for series in [
+            "chainweave_current_lag_blocks",
+            "chainweave_checkpoint_height",
+            "chainweave_reorg_total",
+            "chainweave_reorg_depth_blocks",
+            "chainweave_outbox_unpublished_oldest_age_seconds",
+            "chainweave_outbox_unpublished_count",
+            "chainweave_kafka_delivery_failures_total",
+            "chainweave_decode_failures_total",
+        ] {
+            assert!(metrics.contains(series), "missing metric series {series}");
+        }
     }
 }

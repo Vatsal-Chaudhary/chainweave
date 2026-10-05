@@ -365,7 +365,10 @@ fn record_decode_status(status: DecodeStatus) {
         DecodeStatus::UnknownSignature => {
             counter!("chainweave_decode_unknown_signature_total").increment(1);
         }
-        DecodeStatus::DecodeFailure => counter!("chainweave_decode_failure_total").increment(1),
+        DecodeStatus::DecodeFailure => {
+            counter!("chainweave_decode_failure_total").increment(1);
+            counter!("chainweave_decode_failures_total").increment(1);
+        }
     }
 }
 
