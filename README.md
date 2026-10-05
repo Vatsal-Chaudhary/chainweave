@@ -99,6 +99,24 @@ If port `55432` is already in use, choose another host port:
 POSTGRES_STATE_PORT=55433 make test-postgres-state
 ```
 
+## Single Anvil Reorg Scenario
+
+The deterministic M8-lite scenario requires Foundry Anvil `1.7.1` at commit `4072e48705af9d93e3c0f6e29e93b5e9a40caed8`. The test uses Anvil's `anvil_reorg` extension with tuple-style params `[depth, tx_block_pairs]`; replacement transaction block indexes are relative to the replaced branch segment.
+
+Run the scenario with one command:
+
+```bash
+make test-single-anvil-reorg-scenario
+```
+
+The target starts an isolated disposable Postgres instance, deploys a tiny log-emitting contract on Anvil, writes two old-branch logs, replaces that branch with `anvil_reorg`, reconciles through the existing Postgres writer path, and prints a short trace for detection, rollback, re-apply, and the final canonical log query.
+
+Asciinema artifact: not recorded in this environment because `asciinema` is not installed. To record it locally:
+
+```bash
+asciinema rec docs/single-anvil-reorg.cast -c "make test-single-anvil-reorg-scenario"
+```
+
 The real-testnet smoke test is opt-in:
 
 ```bash

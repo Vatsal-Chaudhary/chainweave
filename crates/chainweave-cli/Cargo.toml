@@ -27,6 +27,7 @@ url.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+sqlx.workspace = true
 
 [lints]
 workspace = true

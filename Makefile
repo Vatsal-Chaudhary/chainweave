@@ -10,6 +10,12 @@ POSTGRES_STATE_DATA_DIR ?= target/postgres-state-data
 POSTGRES_STATE_SOCKET_DIR ?= target/postgres-state-socket
 POSTGRES_STATE_LOG ?= target/postgres-state.log
 POSTGRES_STATE_DATABASE_URL ?= postgresql://postgres:postgres@127.0.0.1:$(POSTGRES_STATE_PORT)/postgres
+M8_LITE_POSTGRES_CONTAINER ?= chainweave-m8-lite-postgres
+M8_LITE_POSTGRES_PORT ?= 55438
+M8_LITE_POSTGRES_DATA_DIR ?= target/m8-lite-postgres-data
+M8_LITE_POSTGRES_SOCKET_DIR ?= target/m8-lite-postgres-socket
+M8_LITE_POSTGRES_LOG ?= target/m8-lite-postgres.log
+M8_LITE_DATABASE_URL ?= postgresql://postgres:postgres@127.0.0.1:$(M8_LITE_POSTGRES_PORT)/postgres
 
 BACKFILL_ACCEPTANCE_RPC_URL ?= https://rpc.sepolia.ethpandaops.io
 BACKFILL_ACCEPTANCE_REFERENCE_RPC_URL ?= https://sepolia.gateway.tenderly.co
@@ -223,6 +229,69 @@ test-anvil-smoke:
 	CHAINWEAVE_TEST_DATABASE_URL='$(POSTGRES_STATE_DATABASE_URL)' \
 	SQLX_OFFLINE=true \
 	cargo test -p chainweave-cli --test anvil_live_smoke -- --ignored --nocapture
+
+.PHONY: test-single-anvil-reorg-scenario
+test-single-anvil-reorg-scenario:
+	if ! command -v anvil >/dev/null 2>&1; then
+		printf 'anvil is required for the single Anvil reorg scenario\n'
+		exit 127
+	fi
+	backend=
+	if [[ '$(POSTGRES_STATE_PROVIDER)' != 'local' ]] && docker ps >/dev/null 2>&1; then
+		backend=docker
+		if docker ps -a --format '{{.Names}}' | grep -qx '$(M8_LITE_POSTGRES_CONTAINER)'; then
+			docker rm -f '$(M8_LITE_POSTGRES_CONTAINER)' >/dev/null
+		fi
+		docker run -d --rm \
+			--name '$(M8_LITE_POSTGRES_CONTAINER)' \
+			-e POSTGRES_PASSWORD=postgres \
+			-e POSTGRES_DB=postgres \
+			-p 127.0.0.1:$(M8_LITE_POSTGRES_PORT):5432 \
+			'$(POSTGRES_STATE_IMAGE)' >/dev/null
+	else
+		if [[ '$(POSTGRES_STATE_PROVIDER)' == 'docker' ]]; then
+			printf 'Docker provider requested but Docker is not accessible\n'
+			exit 1
+		fi
+		backend=local
+		for command in initdb pg_ctl pg_isready; do
+			if ! command -v "$$command" >/dev/null 2>&1; then
+				printf 'Neither Docker nor local Postgres command %s is available\n' "$$command"
+				exit 1
+			fi
+		done
+		rm -rf '$(M8_LITE_POSTGRES_DATA_DIR)' '$(M8_LITE_POSTGRES_SOCKET_DIR)'
+		mkdir -p target '$(M8_LITE_POSTGRES_SOCKET_DIR)'
+		initdb -D '$(M8_LITE_POSTGRES_DATA_DIR)' -A trust -U postgres --no-instructions >/dev/null
+		pg_ctl -D '$(M8_LITE_POSTGRES_DATA_DIR)' -l '$(M8_LITE_POSTGRES_LOG)' -o "-h 127.0.0.1 -p $(M8_LITE_POSTGRES_PORT) -c unix_socket_directories='$(abspath $(M8_LITE_POSTGRES_SOCKET_DIR))'" start >/dev/null
+	fi
+	cleanup() {
+		if [[ "$$backend" == 'docker' ]]; then
+			docker rm -f '$(M8_LITE_POSTGRES_CONTAINER)' >/dev/null 2>&1 || true
+		elif [[ "$$backend" == 'local' ]]; then
+			pg_ctl -D '$(M8_LITE_POSTGRES_DATA_DIR)' -m fast stop >/dev/null 2>&1 || true
+		fi
+	}
+	trap cleanup EXIT
+	for attempt in $$(seq 1 60); do
+		if [[ "$$backend" == 'docker' ]]; then
+			if docker exec '$(M8_LITE_POSTGRES_CONTAINER)' pg_isready -U postgres >/dev/null 2>&1; then
+				break
+			fi
+		else
+			if pg_isready -h 127.0.0.1 -p '$(M8_LITE_POSTGRES_PORT)' -U postgres >/dev/null 2>&1; then
+				break
+			fi
+		fi
+		if [[ "$$attempt" == 60 ]]; then
+			printf 'Postgres did not become ready in time\n'
+			exit 1
+		fi
+		sleep 1
+	done
+	CHAINWEAVE_TEST_DATABASE_URL='$(M8_LITE_DATABASE_URL)' \
+	SQLX_OFFLINE=true \
+	cargo test -p chainweave-cli --test single_anvil_reorg_scenario -- --ignored --nocapture
 
 .PHONY: test-live-acceptance
 test-live-acceptance:

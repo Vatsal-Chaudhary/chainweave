@@ -1391,6 +1391,7 @@ dependencies = [
  "futures",
  "rdkafka",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tokio-util",
